@@ -2259,53 +2259,84 @@ def main():
     """, unsafe_allow_html=True)
     st.caption("Masukkan data → bandingkan model peramalan → dapatkan ramalan terbaik dengan confidence interval")
 
-    # ── Sidebar: User & Dataset management ──
+    # ── Ensure default admin account exists ──
+    conn_check = get_db()
+    if conn_check.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
+        create_user("admin", is_admin=1)
+
+    # ── Session state for login ──
+    if "logged_in_user_id" not in st.session_state:
+        st.session_state.logged_in_user_id = None
+
+    # ── Sidebar: Login / User & Dataset management ──
     with st.sidebar:
-        # ── User section ──
-        st.header("👤 Pengguna")
-        users = list_users()  # each: (id, name, is_admin, created_at)
 
-        with st.expander("➕ Tambah Pengguna Baru", expanded=len(users) == 0):
-            new_user_name = st.text_input("Nama Pengguna", placeholder="contoh: Arifah")
-            if st.button("Daftar", type="primary", use_container_width=True):
-                if new_user_name.strip():
-                    try:
-                        create_user(new_user_name.strip())
-                        first_msg = " (otomatis menjadi Admin)" if len(users) == 0 else ""
-                        st.success(f"Pengguna '{new_user_name.strip()}' berhasil ditambahkan!{first_msg}")
-                        st.rerun()
-                    except sqlite3.IntegrityError:
-                        st.warning("Nama pengguna sudah ada. Silakan pilih nama lain.")
-                else:
-                    st.warning("Nama pengguna tidak boleh kosong.")
+        # ── Not logged in: show login form ──
+        if st.session_state.logged_in_user_id is None:
+            st.header("🔐 Login")
+            login_name = st.text_input("Nama Pengguna", placeholder="Ketik nama pengguna Anda",
+                                       key="login_input")
 
-        if not users:
-            st.info("Belum ada pengguna. Pengguna pertama otomatis menjadi Admin.")
+            col_login, col_daftar = st.columns(2)
+            with col_login:
+                if st.button("Login", type="primary", use_container_width=True):
+                    if login_name.strip():
+                        conn_login = get_db()
+                        row = conn_login.execute(
+                            "SELECT id, name, is_admin FROM users WHERE name=?",
+                            (login_name.strip(),)
+                        ).fetchone()
+                        if row:
+                            st.session_state.logged_in_user_id = row[0]
+                            st.rerun()
+                        else:
+                            st.warning("Pengguna tidak ditemukan. Silakan daftar terlebih dahulu.")
+                    else:
+                        st.warning("Nama pengguna tidak boleh kosong.")
+            with col_daftar:
+                if st.button("Daftar Baru", use_container_width=True):
+                    if login_name.strip():
+                        try:
+                            uid = create_user(login_name.strip())
+                            st.session_state.logged_in_user_id = uid
+                            st.success(f"Pengguna '{login_name.strip()}' berhasil didaftarkan!")
+                            st.rerun()
+                        except sqlite3.IntegrityError:
+                            st.warning("Nama pengguna sudah ada. Silakan gunakan nama lain atau login.")
+                    else:
+                        st.warning("Nama pengguna tidak boleh kosong.")
+
+            st.info("Belum punya akun? Ketik nama lalu klik **Daftar Baru**.")
             st.stop()
 
-        # Build user labels with role indicator
-        user_labels = {}
-        for u in users:
-            role_tag = " 👑" if u[2] == 1 else ""
-            user_labels[f"{u[1]}{role_tag}"] = u[0]
-        selected_user_label = st.selectbox("Pilih Pengguna", list(user_labels.keys()))
-        selected_user_id = user_labels[selected_user_label]
+        # ── Logged in: get user info ──
+        current_user = get_user_info(st.session_state.logged_in_user_id)
+        if current_user is None:
+            # User was deleted by admin — force logout
+            st.session_state.logged_in_user_id = None
+            st.rerun()
 
-        # Get current user's info
-        current_user = get_user_info(selected_user_id)
+        selected_user_id = current_user[0]
         selected_user_name = current_user[1]
         is_current_admin = current_user[2] == 1
 
+        # ── User header & logout ──
+        st.header("👤 Pengguna")
         if is_current_admin:
-            st.caption("🔑 Anda login sebagai **Admin**")
+            st.caption(f"🔑 Login sebagai **{selected_user_name}** (Admin)")
         else:
             st.caption(f"👤 Login sebagai **{selected_user_name}**")
+
+        if st.button("🚪 Logout", use_container_width=True):
+            st.session_state.logged_in_user_id = None
+            st.rerun()
 
         # ── Admin Panel (only visible to admins) ──
         if is_current_admin:
             with st.expander("🔧 Panel Admin"):
                 st.markdown("##### Kelola Pengguna")
 
+                users = list_users()
                 # List all users with admin toggle
                 for u in users:
                     uid, uname, uadmin = u[0], u[1], u[2]
@@ -2330,6 +2361,21 @@ def main():
                                          use_container_width=True):
                                 set_admin(uid, True)
                                 st.rerun()
+
+                st.divider()
+                st.markdown("##### Tambah Pengguna")
+                new_user_name = st.text_input("Nama Pengguna Baru", placeholder="contoh: Arifah",
+                                               key="admin_add_user")
+                if st.button("➕ Tambah", use_container_width=True, key="admin_add_btn"):
+                    if new_user_name.strip():
+                        try:
+                            create_user(new_user_name.strip())
+                            st.success(f"Pengguna '{new_user_name.strip()}' berhasil ditambahkan!")
+                            st.rerun()
+                        except sqlite3.IntegrityError:
+                            st.warning("Nama pengguna sudah ada.")
+                    else:
+                        st.warning("Nama pengguna tidak boleh kosong.")
 
                 st.divider()
                 st.markdown("##### Hapus Pengguna")
