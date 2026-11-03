@@ -18,6 +18,7 @@ import io
 import logging
 import re
 from datetime import datetime
+from itertools import combinations
 from scipy import stats as sp_stats
 
 # ── Forecasting libraries ──
@@ -887,10 +888,10 @@ def run_sarima_frac_d(train, test, order=(1, 0, 1), seasonal_pqd=(1, 1), sp=4,
         # Urutan: seasonal (D) dulu, lalu non-seasonal (d)
         step = train_arr.copy()
         train_after_D = None
-        if frac_D is not None and frac_D > 0:
+        if frac_D is not None and frac_D != 0:
             step, _ = frac_seasonal_diff(step, frac_D, sp)
             train_after_D = step.copy()
-        if frac_d is not None and frac_d > 0:
+        if frac_d is not None and frac_d != 0:
             step, _ = frac_nonseasonal_diff(step, frac_d)
         train_diffed = step
 
@@ -913,11 +914,11 @@ def run_sarima_frac_d(train, test, order=(1, 0, 1), seasonal_pqd=(1, 1), sp=4,
         # Gunakan nilai AKTUAL sebagai history, bukan prediksi sendiri.
         # Urutan undiff: non-seasonal (d) dulu, lalu seasonal (D).
         in_pred = fitted_d.copy()
-        if frac_d is not None and frac_d > 0:
+        if frac_d is not None and frac_d != 0:
             # Undiff nonseasonal: history = actual after_D values
             actual_after_D = train_after_D if train_after_D is not None else train_arr
             in_pred = _frac_insample_undiff(in_pred, actual_after_D, frac_d, 1)
-        if frac_D is not None and frac_D > 0:
+        if frac_D is not None and frac_D != 0:
             # Undiff seasonal: history = actual original train values
             in_pred = _frac_insample_undiff(in_pred, train_arr, frac_D, sp)
 
@@ -928,20 +929,20 @@ def run_sarima_frac_d(train, test, order=(1, 0, 1), seasonal_pqd=(1, 1), sp=4,
         # Gunakan actual train sebagai history awal.
         # Urutan undiff: non-seasonal (d) dulu, lalu seasonal (D).
         out_pred = forecast_d.copy()
-        if frac_d is not None and frac_d > 0:
+        if frac_d is not None and frac_d != 0:
             # History = actual train setelah seasonal diff (at after_D level)
             history_d = train_after_D if train_after_D is not None else train_arr
             out_pred = frac_nonseasonal_undiff(out_pred, history_d, frac_d)
-        if frac_D is not None and frac_D > 0:
+        if frac_D is not None and frac_D != 0:
             # History = actual train (at original level)
             out_pred = frac_seasonal_undiff(out_pred, train_arr, frac_D, sp)
 
         # ── Buat nama model ──
-        d_label = f"{frac_d:g}" if frac_d is not None and frac_d > 0 else "0"
-        D_label = f"{frac_D:g}" if frac_D is not None and frac_D > 0 else "0"
-        is_frac = (frac_d is not None and frac_d > 0 and frac_d != int(frac_d)) or \
-                  (frac_D is not None and frac_D > 0 and frac_D != int(frac_D))
-        no_seasonal = (P == 0 and Q == 0 and (frac_D is None or frac_D < 0.01))
+        d_label = f"{frac_d:g}" if frac_d is not None and frac_d != 0 else "0"
+        D_label = f"{frac_D:g}" if frac_D is not None and frac_D != 0 else "0"
+        is_frac = (frac_d is not None and frac_d != 0 and frac_d != int(frac_d)) or \
+                  (frac_D is not None and frac_D != 0 and frac_D != int(frac_D))
+        no_seasonal = (P == 0 and Q == 0 and (frac_D is None or abs(frac_D) < 0.01))
         if is_frac:
             prefix = "ARFIMA" if no_seasonal else "SARFIMA"
         else:
@@ -956,12 +957,12 @@ def run_sarima_frac_d(train, test, order=(1, 0, 1), seasonal_pqd=(1, 1), sp=4,
             pred_d_fc = np.array(fc_all.predicted_mean[len(test_arr):])
             combined = np.concatenate([train_arr, test_arr])
             pf = pred_d_fc.copy()
-            if frac_d is not None and frac_d > 0:
+            if frac_d is not None and frac_d != 0:
                 hist_d = combined.copy()
-                if frac_D is not None and frac_D > 0:
+                if frac_D is not None and frac_D != 0:
                     hist_d, _ = frac_seasonal_diff(combined, frac_D, sp)
                 pf = frac_nonseasonal_undiff(pf, hist_d, frac_d)
-            if frac_D is not None and frac_D > 0:
+            if frac_D is not None and frac_D != 0:
                 pf = frac_seasonal_undiff(pf, combined, frac_D, sp)
             pf = list(pf)
             lo, hi = residual_ci(residuals, pf, h, 0.95)
@@ -1008,8 +1009,8 @@ def run_sarima(train, test, order=(1, 1, 1), seasonal_order_s=None):
         P_s, D_s, Q_s, sp_s = seasonal_order_s
         p_o, d_o, q_o = order
         # Deteksi fractional d atau D
-        d_is_frac = isinstance(d_o, float) and d_o != int(d_o) and d_o > 0
-        D_is_frac = isinstance(D_s, float) and D_s != int(D_s) and D_s > 0
+        d_is_frac = isinstance(d_o, float) and d_o != int(d_o) and d_o != 0
+        D_is_frac = isinstance(D_s, float) and D_s != int(D_s) and D_s != 0
         is_frac = d_is_frac or D_is_frac
         d_str = f"{d_o:g}" if d_is_frac else str(int(d_o))
         D_str = f"{D_s:g}" if D_is_frac else str(int(D_s))
@@ -1075,11 +1076,8 @@ def run_mlp(train, test, lookback=3, hidden=(64,), activation='relu', max_iter=5
         model = MLPRegressor(
             hidden_layer_sizes=hidden,
             activation=activation,
-            solver='adam',
+            solver='lbfgs',
             max_iter=max_iter,
-            early_stopping=True,
-            validation_fraction=0.15,
-            n_iter_no_change=15,
             random_state=42,
         )
         model.fit(X_train, y_train)
@@ -1170,7 +1168,7 @@ def auto_best_mlp(train, test, frequency="Triwulanan"):
             for act in activations:
                 try:
                     r = run_mlp(train, test, lookback=lb, hidden=hid,
-                                activation=act, max_iter=300)
+                                activation=act, max_iter=500)
                     if r is not None:
                         mdape = calc_mdape(r["out_actual"], r["out_pred"])
                         if not np.isnan(mdape) and (best is None or mdape < best):
@@ -1228,11 +1226,8 @@ def run_mlpx(train, test, exog_train, exog_test,
         model = MLPRegressor(
             hidden_layer_sizes=hidden,
             activation=activation,
-            solver='adam',
+            solver='lbfgs',
             max_iter=max_iter,
-            early_stopping=True,
-            validation_fraction=0.15,
-            n_iter_no_change=15,
             random_state=42,
         )
         model.fit(X_train, y_train)
@@ -1328,26 +1323,30 @@ def auto_best_mlpx(train, test, exog_train, exog_test,
 
     n_cols = exog_train.shape[1] if exog_train.ndim > 1 else 1
 
-    # Susun daftar subset eksogen: seluruh + masing-masing variabel tunggal
+    # Susun daftar subset eksogen: seluruh + individu + kombinasi 2 (jika ≤ 4 eksogen)
     exog_subsets = []
+    all_names = exog_col_names if exog_col_names else [f"X{i+1}" for i in range(n_cols)]
     if n_cols > 1:
         # Seluruh variabel
-        all_names = exog_col_names if exog_col_names else [f"X{i+1}" for i in range(n_cols)]
         exog_subsets.append((exog_train, exog_test, all_names))
         # Masing-masing variabel tunggal
         for c in range(n_cols):
             col_tr = exog_train[:, c:c+1]
             col_te = exog_test[:, c:c+1]
-            c_name = [all_names[c]]
-            exog_subsets.append((col_tr, col_te, c_name))
+            exog_subsets.append((col_tr, col_te, [all_names[c]]))
+        # Kombinasi 2 variabel (jika jumlah eksogen 2-4)
+        if 2 < n_cols <= 4:
+            for combo in combinations(range(n_cols), 2):
+                cols = list(combo)
+                combo_tr = exog_train[:, cols]
+                combo_te = exog_test[:, cols]
+                combo_names = [all_names[c] for c in cols]
+                exog_subsets.append((combo_tr, combo_te, combo_names))
     else:
-        c_names = exog_col_names if exog_col_names else ["X1"]
         if exog_train.ndim == 1:
-            exog_subsets.append((exog_train.reshape(-1, 1), exog_test.reshape(-1, 1), c_names))
+            exog_subsets.append((exog_train.reshape(-1, 1), exog_test.reshape(-1, 1), all_names))
         else:
-            exog_subsets.append((exog_train, exog_test, c_names))
-
-    all_names = exog_col_names if exog_col_names else [f"X{i+1}" for i in range(n_cols)]
+            exog_subsets.append((exog_train, exog_test, all_names))
     best, best_result = None, None
     for ex_tr, ex_te, ex_names in exog_subsets:
         for lb in lookbacks:
@@ -1358,7 +1357,7 @@ def auto_best_mlpx(train, test, exog_train, exog_test,
                     try:
                         r = run_mlpx(train, test, ex_tr, ex_te,
                                      lookback=lb, hidden=hid,
-                                     activation=act, max_iter=300,
+                                     activation=act, max_iter=500,
                                      exog_col_names=ex_names,
                                      all_exog_col_names=all_names)
                         if r is not None:
@@ -1423,12 +1422,11 @@ def gph_estimate_d(series, alpha=0.65):
     slope, intercept, r_val, p_val, std_err = sp_stats.linregress(X, Y)
     d_hat = -slope
 
-    # Clamp ke [0, 1]
-    d_hat = float(np.clip(d_hat, 0.0, 1.0))
+    d_hat = float(d_hat)
 
     # Confidence interval 95%
-    conf_lo = max(0.0, d_hat - 1.96 * std_err)
-    conf_hi = min(1.0, d_hat + 1.96 * std_err)
+    conf_lo = d_hat - 1.96 * std_err
+    conf_hi = d_hat + 1.96 * std_err
 
     return {"d": round(d_hat, 2), "se": float(std_err),
             "conf_lo": round(conf_lo, 2), "conf_hi": round(conf_hi, 2)}
@@ -1494,12 +1492,12 @@ def gph_estimate_seasonal_D(series, sp, alpha=0.65):
 
     try:
         slope, intercept, r_val, p_val, std_err = sp_stats.linregress(X, Y)
-        D_hat = float(np.clip(-slope, 0.0, 1.0))
+        D_hat = float(-slope)
     except Exception:
         return {"D": 0.0, "se": np.nan, "conf_lo": 0.0, "conf_hi": 0.0}
 
-    conf_lo = max(0.0, D_hat - 1.96 * std_err)
-    conf_hi = min(1.0, D_hat + 1.96 * std_err)
+    conf_lo = D_hat - 1.96 * std_err
+    conf_hi = D_hat + 1.96 * std_err
 
     return {"D": round(D_hat, 2), "se": float(std_err),
             "conf_lo": round(conf_lo, 2), "conf_hi": round(conf_hi, 2)}
@@ -1542,37 +1540,29 @@ def auto_sarima_order(train, test, sp, max_p=2, max_d=1, max_q=2,
     gph_D_result = gph_estimate_seasonal_D(train, sp) if sp > 1 else {"D": 0.0}
     D_hat = gph_D_result["D"]
 
-    # ── Kandidat d: tuning penuh 0.1–0.9 ──
-    # Eksplorasi seluruh range fractional d karena GPH bisa noisy
-    d_candidates = [round(x * 0.1, 1) for x in range(1, 10)]  # 0.1, 0.2, ..., 0.9
+    # ── Kandidat d: grid tetap -0.4 s.d. 0.4 (step 0.1) + d^ + 1 ──
+    d_candidates = [round(x * 0.1, 1) for x in range(-4, 5)]  # -0.4, -0.3, ..., 0.4
+    d_candidates.append(1.0)  # differencing penuh (integer)
+    # Tambahkan d^ jika dalam rentang stasioner (-0.5 < d^ < 0.5)
+    if -0.5 < d_hat < 0.5 and round(d_hat, 2) not in d_candidates:
+        d_candidates.append(round(d_hat, 2))
+    d_candidates = sorted(set(d_candidates))
 
-    # ── Kandidat D berdasarkan uji stasioneritas musiman ──
-    if sp > 1 and D_hat > 0:
-        try:
-            seasonal_diff = np.array(train[sp:]) - np.array(train[:-sp])
-            sadf_p = adfuller(seasonal_diff, autolag="AIC")[1]
-            is_seasonal_stationary = sadf_p < 0.05
-        except Exception:
-            is_seasonal_stationary = False
+    # ── Kandidat D: 0, D^, dan 1 ──
+    D_candidates = [0.0, 1.0]
+    # Tambahkan D^ jika dalam rentang valid (0 < D^ < 1)
+    if sp > 1 and 0 < D_hat < 1 and round(D_hat, 2) not in D_candidates:
+        D_candidates.append(round(D_hat, 2))
+    D_candidates = sorted(set(D_candidates))
 
-        if is_seasonal_stationary:
-            D_compare = 0.0
-        else:
-            D_compare = 0.1 if D_hat < 0.5 else 0.9
-
-        D_candidates = sorted(set([round(max(0.0, D_hat), 2),
-                                    round(max(0.0, D_compare), 2)]))
-    else:
-        D_candidates = [0.0]
-
-    best_frac_d = d_hat if d_hat > 0 else None
-    best_frac_D = D_hat if sp > 1 and D_hat > 0 else None
+    best_frac_d = d_hat if -0.5 < d_hat < 0.5 else None
+    best_frac_D = D_hat if sp > 1 and 0 < D_hat < 1 else None
 
     # Grid search
 
     # ── Grid search pada (p, q, P, Q) × kandidat d × kandidat D ──
     for d_try in d_candidates:
-        fd = d_try if d_try > 0 else None
+        fd = d_try if d_try != 0 else None  # d negatif maupun positif
         for D_try in D_candidates:
             fD = D_try if D_try > 0 else None
             for p in range(max_p + 1):
@@ -1793,6 +1783,14 @@ def auto_sarimax_order(train, test, exog_train, exog_test, sp,
             col_tr = exog_train[:, c:c+1]
             col_te = exog_test[:, c:c+1]
             exog_subsets.append((col_tr, col_te, [all_names[c]]))
+        # Kombinasi 2 variabel (jika jumlah eksogen 2-4)
+        if 2 < n_cols <= 4:
+            for combo in combinations(range(n_cols), 2):
+                cols = list(combo)
+                combo_tr = exog_train[:, cols]
+                combo_te = exog_test[:, cols]
+                combo_names = [all_names[c] for c in cols]
+                exog_subsets.append((combo_tr, combo_te, combo_names))
     else:
         if exog_train.ndim == 1:
             exog_subsets.append((exog_train.reshape(-1, 1), exog_test.reshape(-1, 1), all_names))
