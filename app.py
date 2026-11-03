@@ -352,6 +352,35 @@ def add_data_point(did, label, value):
     conn.close()
 
 
+def update_dataset(did, name=None, unit=None):
+    """Update dataset name and/or unit."""
+    conn = get_db()
+    if name is not None:
+        conn.execute("UPDATE datasets SET name=?, updated_at=? WHERE id=?",
+                     (name, datetime.now().isoformat(), did))
+    if unit is not None:
+        conn.execute("UPDATE datasets SET unit=?, updated_at=? WHERE id=?",
+                     (unit, datetime.now().isoformat(), did))
+    conn.commit()
+    conn.close()
+
+
+def update_data_point(pid, period_label=None, value=None):
+    """Update a single data point's period label and/or value."""
+    conn = get_db()
+    if period_label is not None:
+        conn.execute("UPDATE data_points SET period_label=? WHERE id=?", (period_label, pid))
+    if value is not None:
+        conn.execute("UPDATE data_points SET value=? WHERE id=?", (value, pid))
+    # Update dataset's updated_at
+    row = conn.execute("SELECT dataset_id FROM data_points WHERE id=?", (pid,)).fetchone()
+    if row:
+        conn.execute("UPDATE datasets SET updated_at=? WHERE id=?",
+                     (datetime.now().isoformat(), row[0]))
+    conn.commit()
+    conn.close()
+
+
 def delete_data_point(pid):
     conn = get_db()
     conn.execute("DELETE FROM data_points WHERE id=?", (pid,))
@@ -2451,6 +2480,21 @@ def main():
                 ds_options = {f"{d[1]} ({d[2]})": d[0] for d in datasets}
             selected_label = st.selectbox("Pilih Dataset", list(ds_options.keys()))
             selected_id = ds_options[selected_label]
+
+            # Edit dataset name and unit
+            with st.expander("✏️ Edit Dataset"):
+                ds_current = get_dataset_info(selected_id)
+                if ds_current:
+                    edit_name = st.text_input("Nama Dataset", value=ds_current[1], key="edit_ds_name")
+                    edit_unit = st.text_input("Satuan", value=ds_current[3] or "", key="edit_ds_unit")
+                    if st.button("💾 Simpan Perubahan", use_container_width=True, key="save_ds_edit"):
+                        if edit_name.strip():
+                            update_dataset(selected_id, name=edit_name.strip(), unit=edit_unit.strip())
+                            st.success("Dataset berhasil diperbarui!")
+                            st.rerun()
+                        else:
+                            st.warning("Nama dataset tidak boleh kosong.")
+
             # Only admin can delete datasets
             if is_current_admin:
                 if st.button("🗑️ Hapus Dataset Ini", use_container_width=True):
@@ -2721,6 +2765,26 @@ def main():
                     mime="image/png", key="dl_chart_tab1",
                 )
 
+                # Edit individual data points
+                with st.expander("✏️ Edit Data"):
+                    edit_idx = st.selectbox(
+                        "Pilih data yang akan diedit",
+                        range(len(points)),
+                        format_func=lambda i: f"{points[i][1]} = {points[i][2]}",
+                        key="edit_dp_select",
+                    )
+                    sel_point = points[edit_idx]
+                    ec1, ec2 = st.columns(2)
+                    with ec1:
+                        new_period = st.text_input("Periode", value=sel_point[1], key="edit_dp_period")
+                    with ec2:
+                        new_value = st.number_input("Nilai", value=float(sel_point[2]),
+                                                    format="%g", key="edit_dp_value")
+                    if st.button("💾 Simpan Perubahan Data", use_container_width=True, key="save_dp_edit"):
+                        update_data_point(sel_point[0], period_label=new_period, value=new_value)
+                        st.success("Data berhasil diperbarui!")
+                        st.rerun()
+
                 # Only admin can delete individual data points
                 if is_current_admin:
                     with st.expander("Hapus data tertentu"):
@@ -2964,12 +3028,18 @@ Uji ADF/KPSS ditampilkan sebagai **informasi pendukung** untuk analisis.
                 st.caption(f"⚠️ **{r_data['name']}**: ramalan out-of-sample **datar** (flat) — "
                            "tidak memiliki komponen tren/musiman.")
 
-        # ── Charts per model ──
+        # ── Charts per model (sorted by MDAPE ascending = best first) ──
         st.markdown("#### 📈 Grafik Per Model")
         import altair as alt
 
-        for r in results:
-            with st.expander(f"📉 {r['name']}"):
+        # Sort results by MDAPE (same order as Tab 3)
+        results_sorted = sorted(results, key=lambda r: comp_df.loc[comp_df["Model"] == r["name"], "MDAPE (%)"].values[0] if len(comp_df.loc[comp_df["Model"] == r["name"]]) > 0 else 999)
+
+        for r in results_sorted:
+            mdape_val = comp_df.loc[comp_df["Model"] == r["name"], "MDAPE (%)"].values
+            mdape_str = f" — MDAPE: {mdape_val[0]:.2f}%" if len(mdape_val) > 0 else ""
+            is_best = (len(mdape_val) > 0 and mdape_val[0] == comp_df["MDAPE (%)"].min())
+            with st.expander(f"{'🏆 ' if is_best else '📉 '}{r['name']}{mdape_str}"):
                 # ── Model description ──
                 _base = r["name"].split("(")[0].strip() if "(" in r["name"] else r["name"]
                 if _base == "ARIMAX":
