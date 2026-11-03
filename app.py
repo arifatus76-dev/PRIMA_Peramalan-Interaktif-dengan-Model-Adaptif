@@ -1033,7 +1033,7 @@ def run_sarima(train, test, order=(1, 1, 1), seasonal_order_s=None):
 
 # ── 17. Neural Network (MLP) ──
 
-def run_mlp(train, test, lookback=3, hidden=(64,), activation='relu', max_iter=500):
+def run_mlp(train, test, lookback=3, hidden=(64,), activation='relu'):
     """MLPRegressor (scikit-learn) untuk peramalan time series.
     Fitur: sliding window [Y_{t-lb}..Y_{t-1}] + ΔY (differencing) + rolling mean.
     Total fitur per sampel = lookback * 3 (raw + diff + rolling mean).
@@ -1077,8 +1077,12 @@ def run_mlp(train, test, lookback=3, hidden=(64,), activation='relu', max_iter=5
             hidden_layer_sizes=hidden,
             activation=activation,
             solver='adam',
-            max_iter=max_iter,
+            max_iter=1000,
             random_state=42,
+            early_stopping=True,
+            validation_fraction=0.15,
+            n_iter_no_change=15,
+            learning_rate='adaptive',
         )
         model.fit(X_train, y_train)
 
@@ -1168,7 +1172,7 @@ def auto_best_mlp(train, test, frequency="Triwulanan"):
             for act in activations:
                 try:
                     r = run_mlp(train, test, lookback=lb, hidden=hid,
-                                activation=act, max_iter=500)
+                                activation=act)
                     if r is not None:
                         mdape = calc_mdape(r["out_actual"], r["out_pred"])
                         if not np.isnan(mdape) and (best is None or mdape < best):
@@ -1180,7 +1184,7 @@ def auto_best_mlp(train, test, frequency="Triwulanan"):
 
 # ── 15b. MLPX — MLP dengan variabel eksogen ──
 def run_mlpx(train, test, exog_train, exog_test,
-             lookback=3, hidden=(12,), activation='relu', max_iter=500,
+             lookback=3, hidden=(12,), activation='relu',
              exog_col_names=None, all_exog_col_names=None):
     """MLPRegressor dengan variabel eksogen.
 
@@ -1227,8 +1231,12 @@ def run_mlpx(train, test, exog_train, exog_test,
             hidden_layer_sizes=hidden,
             activation=activation,
             solver='adam',
-            max_iter=max_iter,
+            max_iter=1000,
             random_state=42,
+            early_stopping=True,
+            validation_fraction=0.15,
+            n_iter_no_change=15,
+            learning_rate='adaptive',
         )
         model.fit(X_train, y_train)
 
@@ -1357,7 +1365,7 @@ def auto_best_mlpx(train, test, exog_train, exog_test,
                     try:
                         r = run_mlpx(train, test, ex_tr, ex_te,
                                      lookback=lb, hidden=hid,
-                                     activation=act, max_iter=500,
+                                     activation=act,
                                      exog_col_names=ex_names,
                                      all_exog_col_names=all_names)
                         if r is not None:
@@ -1540,8 +1548,8 @@ def auto_sarima_order(train, test, sp, max_p=2, max_d=1, max_q=2,
     gph_D_result = gph_estimate_seasonal_D(train, sp) if sp > 1 else {"D": 0.0}
     D_hat = gph_D_result["D"]
 
-    # ── Kandidat d: grid tetap -0.4 s.d. 0.4 (step 0.1) + d^ + 1 ──
-    d_candidates = [round(x * 0.1, 1) for x in range(-4, 5)]  # -0.4, -0.3, ..., 0.4
+    # ── Kandidat d: grid tetap 0 s.d. 0.4 (step 0.1) + d^ + 1 ──
+    d_candidates = [round(x * 0.1, 1) for x in range(0, 5)]  # 0, 0.1, 0.2, 0.3, 0.4
     d_candidates.append(1.0)  # differencing penuh (integer)
     # Tambahkan d^ jika dalam rentang stasioner (-0.5 < d^ < 0.5)
     if -0.5 < d_hat < 0.5 and round(d_hat, 2) not in d_candidates:
@@ -2216,7 +2224,7 @@ def run_all_models(values, frequency, train_ratio=0.8,
         try:
             best_lb, best_hid, best_act = auto_best_mlp(train, test, frequency=frequency)
             r = run_mlp(train, test, lookback=best_lb, hidden=best_hid,
-                        activation=best_act, max_iter=500)
+                        activation=best_act)
             if r: results.append(r)
             else: skipped.append("Neural Network (MLP)")
         except Exception:
