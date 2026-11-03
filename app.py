@@ -1076,7 +1076,7 @@ def run_mlp(train, test, lookback=3, hidden=(64,), activation='relu', max_iter=5
         model = MLPRegressor(
             hidden_layer_sizes=hidden,
             activation=activation,
-            solver='lbfgs',
+            solver='adam',
             max_iter=max_iter,
             random_state=42,
         )
@@ -1226,7 +1226,7 @@ def run_mlpx(train, test, exog_train, exog_test,
         model = MLPRegressor(
             hidden_layer_sizes=hidden,
             activation=activation,
-            solver='lbfgs',
+            solver='adam',
             max_iter=max_iter,
             random_state=42,
         )
