@@ -1037,17 +1037,34 @@ def run_sarima(train, test, order=(1, 1, 1), seasonal_order_s=None):
 
 # ── 17. Neural Network (MLP) ──
 
-def run_mlp(train, test, lookback=3, hidden=(64,), activation='relu'):
+def _fourier_features(t_index, seasonal_period, n_harmonics=2):
+    """Buat Fourier features (sin/cos) untuk menangkap pola musiman/siklus.
+    t_index: posisi waktu (integer)
+    seasonal_period: panjang siklus musiman (misal 12 untuk bulanan)
+    n_harmonics: jumlah harmonic (default 2 = siklus utama + sub-siklus)
+    Return: list of floats [sin1, cos1, sin2, cos2, ...]
+    """
+    feats = []
+    for h in range(1, n_harmonics + 1):
+        feats.append(np.sin(2 * np.pi * h * t_index / seasonal_period))
+        feats.append(np.cos(2 * np.pi * h * t_index / seasonal_period))
+    return feats
+
+
+def run_mlp(train, test, lookback=3, hidden=(64,), activation='relu',
+            seasonal_period=None):
     """MLPRegressor (scikit-learn) untuk peramalan time series.
-    Fitur: sliding window [Y_{t-lb}..Y_{t-1}] + ΔY (differencing) + rolling mean.
-    Total fitur per sampel = lookback * 3 (raw + diff + rolling mean).
+    Fitur: sliding window + ΔY + rolling mean + Fourier features (sin/cos).
+    Total fitur per sampel = lookback * 3 + (4 jika seasonal_period).
     """
     try:
         combined = np.array(list(train) + list(test), dtype=float).reshape(-1, 1)
         scaler = MinMaxScaler(feature_range=(0, 1))
         scaled = scaler.fit_transform(combined).flatten()
 
-        # Buat fitur yang diperkaya: raw window + differencing + rolling mean
+        sp = seasonal_period  # shorthand
+
+        # Buat fitur yang diperkaya: raw window + differencing + rolling mean + Fourier
         def build_features(seq, lookback):
             """Dari sequence 1D, buat X dan y dengan fitur tambahan."""
             X, y = [], []
@@ -1059,16 +1076,19 @@ def run_mlp(train, test, lookback=3, hidden=(64,), activation='relu'):
                 feat_diff = [0.0] + [window[j] - window[j - 1] for j in range(1, lookback)]
                 # Fitur 3: rolling mean (expanding mean sampai posisi j dalam window)
                 feat_rmean = [np.mean(window[:j + 1]) for j in range(lookback)]
-                X.append(feat_raw + feat_diff + feat_rmean)
+                # Fitur 4: Fourier features (sin/cos) untuk pola musiman/siklus
+                feat_fourier = _fourier_features(i, sp) if sp else []
+                X.append(feat_raw + feat_diff + feat_rmean + feat_fourier)
                 y.append(seq[i])
             return np.array(X), np.array(y)
 
-        def build_single_feature(window):
+        def build_single_feature(window, t_index=0):
             """Buat vektor fitur dari satu window."""
             feat_raw = list(window)
             feat_diff = [0.0] + [window[j] - window[j - 1] for j in range(1, len(window))]
             feat_rmean = [np.mean(window[:j + 1]) for j in range(len(window))]
-            return np.array(feat_raw + feat_diff + feat_rmean)
+            feat_fourier = _fourier_features(t_index, sp) if sp else []
+            return np.array(feat_raw + feat_diff + feat_rmean + feat_fourier)
 
         scaled_train = scaled[:len(train)]
 
@@ -1101,9 +1121,10 @@ def run_mlp(train, test, lookback=3, hidden=(64,), activation='relu'):
         # Out-of-sample predictions (recursive)
         last_seq = list(scaled_train[-lookback:])
         out_pred_scaled = []
-        for _ in range(len(test)):
+        n_train = len(train)
+        for t_idx in range(len(test)):
             window = np.array(last_seq[-lookback:])
-            x_input = build_single_feature(window).reshape(1, -1)
+            x_input = build_single_feature(window, t_index=n_train + t_idx).reshape(1, -1)
             pred_val = model.predict(x_input)[0]
             out_pred_scaled.append(pred_val)
             last_seq.append(pred_val)
@@ -1119,13 +1140,14 @@ def run_mlp(train, test, lookback=3, hidden=(64,), activation='relu'):
         _scaler = scaler
         _lookback = lookback
         _last_known = list(scaled[:len(train) + len(test)])
+        _total_len = len(train) + len(test)
 
         def fc(h):
             seq = list(_last_known[-_lookback:])
             preds_scaled = []
-            for _ in range(h):
+            for fi in range(h):
                 window = np.array(seq[-_lookback:])
-                x_in = build_single_feature(window).reshape(1, -1)
+                x_in = build_single_feature(window, t_index=_total_len + fi).reshape(1, -1)
                 p_val = _model.predict(x_in)[0]
                 preds_scaled.append(p_val)
                 seq.append(p_val)
@@ -1158,7 +1180,7 @@ def _get_lookbacks(frequency):
     return lb_map.get(frequency, [2, 3, 4])
 
 
-def auto_best_mlp(train, test, frequency="Triwulanan"):
+def auto_best_mlp(train, test, frequency="Triwulanan", seasonal_period=None):
     """Coba beberapa kombinasi hyperparameter MLP, pilih MDAPE terkecil.
 
     Lookback disesuaikan dengan frekuensi data.
@@ -1176,7 +1198,7 @@ def auto_best_mlp(train, test, frequency="Triwulanan"):
             for act in activations:
                 try:
                     r = run_mlp(train, test, lookback=lb, hidden=hid,
-                                activation=act)
+                                activation=act, seasonal_period=seasonal_period)
                     if r is not None:
                         mdape = calc_mdape(r["out_actual"], r["out_pred"])
                         if not np.isnan(mdape) and (best is None or mdape < best):
@@ -1189,10 +1211,11 @@ def auto_best_mlp(train, test, frequency="Triwulanan"):
 # ── 15b. MLPX — MLP dengan variabel eksogen ──
 def run_mlpx(train, test, exog_train, exog_test,
              lookback=3, hidden=(12,), activation='relu',
-             exog_col_names=None, all_exog_col_names=None):
+             exog_col_names=None, all_exog_col_names=None,
+             seasonal_period=None):
     """MLPRegressor dengan variabel eksogen.
 
-    Fitur: sliding window + ΔY + rolling mean + variabel eksogen pada waktu t.
+    Fitur: sliding window + ΔY + rolling mean + Fourier features + variabel eksogen.
     all_exog_col_names: daftar lengkap nama kolom eksogen (untuk subsetting exog_future).
     """
     try:
@@ -1205,6 +1228,8 @@ def run_mlpx(train, test, exog_train, exog_test,
         scaled_x = scaler_x.fit_transform(exog_all)
         n_exog_cols = scaled_x.shape[1]
 
+        sp = seasonal_period  # shorthand
+
         def build_features(seq_y, exog_scaled, lookback):
             X, y = [], []
             for i in range(lookback, len(seq_y)):
@@ -1212,17 +1237,19 @@ def run_mlpx(train, test, exog_train, exog_test,
                 feat_raw = list(window)
                 feat_diff = [0.0] + [window[j] - window[j-1] for j in range(1, lookback)]
                 feat_rmean = [np.mean(window[:j+1]) for j in range(lookback)]
+                feat_fourier = _fourier_features(i, sp) if sp else []
                 feat_exog = list(exog_scaled[i])
-                X.append(feat_raw + feat_diff + feat_rmean + feat_exog)
+                X.append(feat_raw + feat_diff + feat_rmean + feat_fourier + feat_exog)
                 y.append(seq_y[i])
             return np.array(X), np.array(y)
 
-        def build_single_feature(window, exog_row):
+        def build_single_feature(window, exog_row, t_index=0):
             feat_raw = list(window)
             feat_diff = [0.0] + [window[j] - window[j-1] for j in range(1, len(window))]
             feat_rmean = [np.mean(window[:j+1]) for j in range(len(window))]
+            feat_fourier = _fourier_features(t_index, sp) if sp else []
             feat_exog = list(exog_row)
-            return np.array(feat_raw + feat_diff + feat_rmean + feat_exog)
+            return np.array(feat_raw + feat_diff + feat_rmean + feat_fourier + feat_exog)
 
         scaled_train_y = scaled_y[:len(train)]
         scaled_train_x = scaled_x[:len(train)]
@@ -1256,9 +1283,11 @@ def run_mlpx(train, test, exog_train, exog_test,
         last_seq = list(scaled_train_y[-lookback:])
         scaled_test_x = scaled_x[len(train):]
         out_pred_scaled = []
+        n_train = len(train)
         for t in range(len(test)):
             window = np.array(last_seq[-lookback:])
-            x_input = build_single_feature(window, scaled_test_x[t]).reshape(1, -1)
+            x_input = build_single_feature(window, scaled_test_x[t],
+                                           t_index=n_train + t).reshape(1, -1)
             pred_val = model.predict(x_input)[0]
             out_pred_scaled.append(pred_val)
             last_seq.append(pred_val)
@@ -1280,6 +1309,7 @@ def run_mlpx(train, test, exog_train, exog_test,
         _last_known = list(scaled_y[:len(train) + len(test)])
         _exog_col_names = exog_col_names or []
         _all_exog_col_names = all_exog_col_names or []
+        _total_len = len(train) + len(test)
 
         def fc(h, exog_future=None):
             if exog_future is None:
@@ -1298,9 +1328,10 @@ def run_mlpx(train, test, exog_train, exog_test,
 
             seq = list(_last_known[-_lookback:])
             preds_scaled = []
-            for t in range(h):
+            for fi in range(h):
                 window = np.array(seq[-_lookback:])
-                x_in = build_single_feature(window, exog_fut_scaled[t]).reshape(1, -1)
+                x_in = build_single_feature(window, exog_fut_scaled[fi],
+                                            t_index=_total_len + fi).reshape(1, -1)
                 p_val = _model.predict(x_in)[0]
                 preds_scaled.append(p_val)
                 seq.append(p_val)
@@ -1323,7 +1354,8 @@ def run_mlpx(train, test, exog_train, exog_test,
 
 
 def auto_best_mlpx(train, test, exog_train, exog_test,
-                   frequency="Triwulanan", exog_col_names=None):
+                   frequency="Triwulanan", exog_col_names=None,
+                   seasonal_period=None):
     """Auto-tuning MLPX: coba semua kombinasi hyperparameter + subset eksogen.
 
     Membandingkan penggunaan seluruh variabel eksogen vs setiap variabel tunggal,
@@ -1371,7 +1403,8 @@ def auto_best_mlpx(train, test, exog_train, exog_test,
                                      lookback=lb, hidden=hid,
                                      activation=act,
                                      exog_col_names=ex_names,
-                                     all_exog_col_names=all_names)
+                                     all_exog_col_names=all_names,
+                                     seasonal_period=seasonal_period)
                         if r is not None:
                             mdape = calc_mdape(r["out_actual"], r["out_pred"])
                             if not np.isnan(mdape) and (best is None or mdape < best):
@@ -2226,9 +2259,11 @@ def run_all_models(values, frequency, train_ratio=0.8,
     # 4. Neural Network (MLP) — auto-select best hyperparameters
     if len(train) >= 6:
         try:
-            best_lb, best_hid, best_act = auto_best_mlp(train, test, frequency=frequency)
+            _sp = FREQ_SEASONAL.get(frequency)
+            best_lb, best_hid, best_act = auto_best_mlp(train, test, frequency=frequency,
+                                                         seasonal_period=_sp)
             r = run_mlp(train, test, lookback=best_lb, hidden=best_hid,
-                        activation=best_act)
+                        activation=best_act, seasonal_period=_sp)
             if r: results.append(r)
             else: skipped.append("Neural Network (MLP)")
         except Exception:
@@ -2241,7 +2276,8 @@ def run_all_models(values, frequency, train_ratio=0.8,
         try:
             r_mlpx = auto_best_mlpx(train, test, exog_train, exog_test,
                                     frequency=frequency,
-                                    exog_col_names=exog_col_names)
+                                    exog_col_names=exog_col_names,
+                                    seasonal_period=FREQ_SEASONAL.get(frequency))
             if r_mlpx:
                 results.append(r_mlpx)
             else:
