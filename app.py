@@ -132,7 +132,11 @@ def make_line_chart_png(periodes, series_dict, title="", ylabel="Nilai",
 # ══════════════════════════════════════════════════════════════
 # DATABASE
 # ══════════════════════════════════════════════════════════════
-DB_PATH = os.path.join(os.path.dirname(__file__), "forecasting_data.db")
+# Otomatis deteksi: Railway (ada folder /data) atau Streamlit Cloud
+if os.path.exists("/data"):
+    DB_PATH = "/data/forecasting_data.db"
+else:
+    DB_PATH = os.path.join(os.path.dirname(__file__), "forecasting_data.db")
 
 
 def get_db():
