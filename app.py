@@ -3903,16 +3903,23 @@ Uji ADF/KPSS ditampilkan sebagai **informasi pendukung** untuk analisis.
                     _m_lb = _re.search(r"lb=(\d+)", model_name)
                     _m_h = _re.search(r"h=([^,\)]+)", model_name)
                     _m_act = _re.search(r"(relu|tanh)", model_name)
+                    _m_d = _re.search(r"d=([0-9.]+)", model_name)
                     _lb_val = _m_lb.group(1) if _m_lb else "?"
                     _h_val = _m_h.group(1) if _m_h else "?"
                     _act_val = _m_act.group(1) if _m_act else "?"
+                    _d_val = _m_d.group(1) if _m_d else "0"
                     st.markdown("---")
                     st.markdown("**🧠 Kesimpulan Hyperparameter Terpilih:**")
+                    _d_desc = "tanpa differencing" if _d_val == "0" else (
+                        "differencing penuh (integer)" if _d_val == "1.0" or _d_val == "1"
+                        else f"fractional differencing (d optimal SARFIMA)")
                     st.markdown(
                         f"- **Lookback (lb):** {_lb_val} — model melihat {_lb_val} periode ke belakang\n"
-                        f"- **Hidden neurons (h):** {_h_val} — jumlah neuron pada hidden layer\n"
+                        f"- **Hidden neurons (h):** {_h_val} — jumlah neuron pada hidden layer "
+                        f"(otomatis = min(⅔ × jumlah input, 20))\n"
                         f"- **Fungsi aktivasi:** `{_act_val}` — "
-                        f"{'menangkap non-linearitas dengan output [-1, 1]' if _act_val == 'tanh' else 'sederhana dan efisien, output [0, ∞)'}"
+                        f"{'menangkap non-linearitas dengan output [-1, 1]' if _act_val == 'tanh' else 'sederhana dan efisien, output [0, ∞)'}\n"
+                        f"- **Differencing (d):** {_d_val} — {_d_desc}"
                     )
                     if base_name == "MLPX":
                         _m_exog = _re.search(r"\[([^\]]+)\]", model_name)
