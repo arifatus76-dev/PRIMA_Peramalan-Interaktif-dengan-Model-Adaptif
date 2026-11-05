@@ -1052,13 +1052,28 @@ def _fourier_features(t_index, seasonal_period, n_harmonics=2):
 
 
 def run_mlp(train, test, lookback=3, hidden=(64,), activation='relu',
-            seasonal_period=None):
+            seasonal_period=None, frac_d=0.0):
     """MLPRegressor (scikit-learn) untuk peramalan time series.
     Fitur: sliding window + ΔY + rolling mean + Fourier features (sin/cos).
     Total fitur per sampel = lookback * 3 + (4 jika seasonal_period).
+    frac_d: fractional differencing parameter (0 = tanpa differencing).
     """
     try:
-        combined = np.array(list(train) + list(test), dtype=float).reshape(-1, 1)
+        train_arr = np.array(train, dtype=float)
+        test_arr = np.array(test, dtype=float)
+
+        # Fractional differencing jika d > 0
+        if frac_d and frac_d > 0:
+            train_diffed, _ = frac_nonseasonal_diff(train_arr, frac_d)
+            test_diffed, _ = frac_nonseasonal_diff(
+                np.concatenate([train_arr, test_arr]), frac_d)
+            test_diffed = test_diffed[len(train_diffed):]
+            combined_diffed = np.concatenate([train_diffed, test_diffed])
+        else:
+            train_diffed = train_arr.copy()
+            combined_diffed = np.concatenate([train_arr, test_arr])
+
+        combined = combined_diffed.reshape(-1, 1)
         scaler = MinMaxScaler(feature_range=(0, 1))
         scaled = scaler.fit_transform(combined).flatten()
 
@@ -1110,37 +1125,58 @@ def run_mlp(train, test, lookback=3, hidden=(64,), activation='relu',
         )
         model.fit(X_train, y_train)
 
-        # In-sample predictions
+        # In-sample predictions (dalam ruang differenced & scaled)
         in_pred_scaled = model.predict(X_train)
-        in_pred_full = np.full(len(train), np.nan)
-        in_pred_unscaled = scaler.inverse_transform(in_pred_scaled.reshape(-1, 1)).flatten()
-        in_pred_full[lookback:] = in_pred_unscaled
-        if lookback > 0 and len(in_pred_unscaled) > 0:
-            in_pred_full[:lookback] = in_pred_unscaled[0]
+        in_pred_diffed = scaler.inverse_transform(in_pred_scaled.reshape(-1, 1)).flatten()
+
+        # Inverse differencing in-sample
+        if frac_d and frac_d > 0:
+            in_pred_orig = _frac_insample_undiff(in_pred_diffed, train_arr, frac_d, 1)
+            in_pred_full = np.full(len(train), np.nan)
+            offset = len(train) - len(in_pred_orig)
+            in_pred_full[offset:] = in_pred_orig
+            if offset > 0 and len(in_pred_orig) > 0:
+                in_pred_full[:offset] = in_pred_orig[0]
+        else:
+            in_pred_full = np.full(len(train), np.nan)
+            in_pred_full[lookback:] = in_pred_diffed
+            if lookback > 0 and len(in_pred_diffed) > 0:
+                in_pred_full[:lookback] = in_pred_diffed[0]
 
         # Out-of-sample predictions (recursive)
-        last_seq = list(scaled_train[-lookback:])
+        n_train_d = len(train_diffed)
+        last_seq = list(scaled[:n_train_d][-lookback:])
         out_pred_scaled = []
-        n_train = len(train)
         for t_idx in range(len(test)):
             window = np.array(last_seq[-lookback:])
-            x_input = build_single_feature(window, t_index=n_train + t_idx).reshape(1, -1)
+            x_input = build_single_feature(window, t_index=n_train_d + t_idx).reshape(1, -1)
             pred_val = model.predict(x_input)[0]
             out_pred_scaled.append(pred_val)
             last_seq.append(pred_val)
 
-        out_pred = scaler.inverse_transform(np.array(out_pred_scaled).reshape(-1, 1)).flatten()
+        out_pred_diffed = scaler.inverse_transform(
+            np.array(out_pred_scaled).reshape(-1, 1)).flatten()
+
+        # Inverse differencing out-of-sample
+        if frac_d and frac_d > 0:
+            out_pred = frac_nonseasonal_undiff(out_pred_diffed, train_arr, frac_d)
+        else:
+            out_pred = out_pred_diffed
+
         residuals = np.array(train) - in_pred_full
 
         h_str = "x".join(str(h) for h in hidden)
-        label = f"MLP(lb={lookback}, h={h_str}, {activation})"
+        d_str = f", d={frac_d}" if frac_d and frac_d > 0 else ""
+        label = f"MLP(lb={lookback}, h={h_str}, {activation}{d_str})"
 
         # Closure for forecast
         _model = model
         _scaler = scaler
         _lookback = lookback
-        _last_known = list(scaled[:len(train) + len(test)])
-        _total_len = len(train) + len(test)
+        _last_known = list(scaled)
+        _total_len = len(scaled)
+        _frac_d = frac_d
+        _train_arr = train_arr
 
         def fc(h):
             seq = list(_last_known[-_lookback:])
@@ -1151,8 +1187,13 @@ def run_mlp(train, test, lookback=3, hidden=(64,), activation='relu',
                 p_val = _model.predict(x_in)[0]
                 preds_scaled.append(p_val)
                 seq.append(p_val)
-            pf = list(_scaler.inverse_transform(
+            pf_diffed = list(_scaler.inverse_transform(
                 np.array(preds_scaled).reshape(-1, 1)).flatten())
+            if _frac_d and _frac_d > 0:
+                all_orig = np.concatenate([_train_arr, np.array(test)])
+                pf = list(frac_nonseasonal_undiff(np.array(pf_diffed), all_orig, _frac_d))
+            else:
+                pf = pf_diffed
             lo, hi = residual_ci(residuals, pf, h, 0.95)
             lo80, hi80 = residual_ci(residuals, pf, h, 0.80)
             return pf, lo, hi, lo80, hi80
@@ -1170,39 +1211,63 @@ def run_mlp(train, test, lookback=3, hidden=(64,), activation='relu',
 def _get_lookbacks(frequency):
     """Tentukan kandidat lookback berdasarkan frekuensi data."""
     lb_map = {
-        "Harian": [3, 5, 7, 14],
-        "Mingguan": [2, 4, 8],
-        "Bulanan": [3, 6, 12],
-        "Triwulanan": [2, 3, 4],
-        "Semesteran": [2, 3, 4],
-        "Tahunan": [2, 3, 4],
+        "Harian": [7, 14],
+        "Mingguan": [8, 12],
+        "Bulanan": [12, 18],
+        "Triwulanan": [4, 8],
+        "Semesteran": [3, 5],
+        "Tahunan": [3, 5],
     }
-    return lb_map.get(frequency, [2, 3, 4])
+    return lb_map.get(frequency, [3, 5])
 
 
-def auto_best_mlp(train, test, frequency="Triwulanan", seasonal_period=None):
+# Frekuensi yang menggunakan Fourier features pada MLP/MLPX
+_MLP_FOURIER_FREQ = {"Harian", "Mingguan", "Bulanan", "Triwulanan"}
+
+
+def auto_best_mlp(train, test, frequency="Triwulanan", seasonal_period=None,
+                  frac_d_sarfima=None):
     """Coba beberapa kombinasi hyperparameter MLP, pilih MDAPE terkecil.
 
     Lookback disesuaikan dengan frekuensi data.
-    Hidden layer: single layer [6, 12, 18, 24, 30].
+    Neuron = min(⅔ × jumlah input, 20).
+    Differencing: d ∈ {0, d_sarfima, 1}.
+    Fourier: aktif untuk Harian/Mingguan/Bulanan/Triwulanan.
     """
     lookbacks = _get_lookbacks(frequency)
-    hidden_list = [(6,), (12,), (18,), (24,), (30,)]
     activations = ['relu', 'tanh']
+    use_fourier = frequency in _MLP_FOURIER_FREQ
 
-    best, best_cfg = None, (lookbacks[0], (12,), 'relu')
+    # Kandidat differencing: 0, d_sarfima (jika tersedia & berbeda), 1
+    d_candidates = [0.0]
+    if frac_d_sarfima is not None and frac_d_sarfima > 0 and frac_d_sarfima != 1.0:
+        d_candidates.append(round(frac_d_sarfima, 4))
+    d_candidates.append(1.0)
+    d_candidates = sorted(set(d_candidates))
+
+    # sp untuk Fourier: gunakan seasonal_period hanya jika frekuensi mendukung
+    sp_fourier = seasonal_period if use_fourier else None
+
+    best, best_cfg = None, (lookbacks[0], (12,), 'relu', 0.0)
     for lb in lookbacks:
         if lb >= len(train) - 2:
             continue
-        for hid in hidden_list:
+        # Hitung neuron otomatis: min(⅔ × input, 20)
+        n_input = lb * 3 + (4 if sp_fourier else 0)
+        n_hidden = min(int(round(n_input * 2 / 3)), 20)
+        n_hidden = max(n_hidden, 2)  # minimal 2 neuron
+        hid = (n_hidden,)
+
+        for d_try in d_candidates:
             for act in activations:
                 try:
                     r = run_mlp(train, test, lookback=lb, hidden=hid,
-                                activation=act, seasonal_period=seasonal_period)
+                                activation=act, seasonal_period=sp_fourier,
+                                frac_d=d_try)
                     if r is not None:
                         mdape = calc_mdape(r["out_actual"], r["out_pred"])
                         if not np.isnan(mdape) and (best is None or mdape < best):
-                            best, best_cfg = mdape, (lb, hid, act)
+                            best, best_cfg = mdape, (lb, hid, act, d_try)
                 except Exception:
                     continue
     return best_cfg
@@ -1212,18 +1277,39 @@ def auto_best_mlp(train, test, frequency="Triwulanan", seasonal_period=None):
 def run_mlpx(train, test, exog_train, exog_test,
              lookback=3, hidden=(12,), activation='relu',
              exog_col_names=None, all_exog_col_names=None,
-             seasonal_period=None):
+             seasonal_period=None, frac_d=0.0):
     """MLPRegressor dengan variabel eksogen.
 
     Fitur: sliding window + ΔY + rolling mean + Fourier features + variabel eksogen.
     all_exog_col_names: daftar lengkap nama kolom eksogen (untuk subsetting exog_future).
+    frac_d: fractional differencing parameter (0 = tanpa differencing).
     """
     try:
-        combined = np.array(list(train) + list(test), dtype=float).reshape(-1, 1)
+        train_arr = np.array(train, dtype=float)
+        test_arr = np.array(test, dtype=float)
+
+        # Fractional differencing jika d > 0
+        if frac_d and frac_d > 0:
+            train_diffed, _ = frac_nonseasonal_diff(train_arr, frac_d)
+            full_arr = np.concatenate([train_arr, test_arr])
+            full_diffed, _ = frac_nonseasonal_diff(full_arr, frac_d)
+            test_diffed = full_diffed[len(train_diffed):]
+            combined_diffed = np.concatenate([train_diffed, test_diffed])
+            # Sesuaikan exog: hilangkan baris awal yang hilang karena differencing
+            n_lost = len(train_arr) - len(train_diffed)
+            exog_train_d = exog_train[n_lost:]
+            exog_test_d = exog_test
+        else:
+            train_diffed = train_arr.copy()
+            combined_diffed = np.concatenate([train_arr, test_arr])
+            exog_train_d = exog_train
+            exog_test_d = exog_test
+
+        combined = combined_diffed.reshape(-1, 1)
         scaler_y = MinMaxScaler(feature_range=(0, 1))
         scaled_y = scaler_y.fit_transform(combined).flatten()
 
-        exog_all = np.vstack([exog_train, exog_test])
+        exog_all = np.vstack([exog_train_d, exog_test_d])
         scaler_x = MinMaxScaler(feature_range=(0, 1))
         scaled_x = scaler_x.fit_transform(exog_all)
         n_exog_cols = scaled_x.shape[1]
@@ -1251,8 +1337,9 @@ def run_mlpx(train, test, exog_train, exog_test,
             feat_exog = list(exog_row)
             return np.array(feat_raw + feat_diff + feat_rmean + feat_fourier + feat_exog)
 
-        scaled_train_y = scaled_y[:len(train)]
-        scaled_train_x = scaled_x[:len(train)]
+        n_train_d = len(train_diffed)
+        scaled_train_y = scaled_y[:n_train_d]
+        scaled_train_x = scaled_x[:n_train_d]
 
         X_train, y_train = build_features(scaled_train_y, scaled_train_x, lookback)
         if len(X_train) < 3:
@@ -1271,45 +1358,65 @@ def run_mlpx(train, test, exog_train, exog_test,
         )
         model.fit(X_train, y_train)
 
-        # In-sample
+        # In-sample (dalam ruang differenced & scaled)
         in_pred_scaled = model.predict(X_train)
-        in_pred_full = np.full(len(train), np.nan)
-        in_pred_unscaled = scaler_y.inverse_transform(in_pred_scaled.reshape(-1, 1)).flatten()
-        in_pred_full[lookback:] = in_pred_unscaled
-        if lookback > 0 and len(in_pred_unscaled) > 0:
-            in_pred_full[:lookback] = in_pred_unscaled[0]
+        in_pred_diffed = scaler_y.inverse_transform(in_pred_scaled.reshape(-1, 1)).flatten()
+
+        # Inverse differencing in-sample
+        if frac_d and frac_d > 0:
+            in_pred_orig = _frac_insample_undiff(in_pred_diffed, train_arr, frac_d, 1)
+            in_pred_full = np.full(len(train), np.nan)
+            offset = len(train) - len(in_pred_orig)
+            in_pred_full[offset:] = in_pred_orig
+            if offset > 0 and len(in_pred_orig) > 0:
+                in_pred_full[:offset] = in_pred_orig[0]
+        else:
+            in_pred_full = np.full(len(train), np.nan)
+            in_pred_full[lookback:] = in_pred_diffed
+            if lookback > 0 and len(in_pred_diffed) > 0:
+                in_pred_full[:lookback] = in_pred_diffed[0]
 
         # Out-of-sample
-        last_seq = list(scaled_train_y[-lookback:])
-        scaled_test_x = scaled_x[len(train):]
+        last_seq = list(scaled_y[:n_train_d][-lookback:])
+        scaled_test_x = scaled_x[n_train_d:]
         out_pred_scaled = []
-        n_train = len(train)
         for t in range(len(test)):
             window = np.array(last_seq[-lookback:])
             x_input = build_single_feature(window, scaled_test_x[t],
-                                           t_index=n_train + t).reshape(1, -1)
+                                           t_index=n_train_d + t).reshape(1, -1)
             pred_val = model.predict(x_input)[0]
             out_pred_scaled.append(pred_val)
             last_seq.append(pred_val)
 
-        out_pred = scaler_y.inverse_transform(np.array(out_pred_scaled).reshape(-1, 1)).flatten()
+        out_pred_diffed = scaler_y.inverse_transform(
+            np.array(out_pred_scaled).reshape(-1, 1)).flatten()
+
+        # Inverse differencing out-of-sample
+        if frac_d and frac_d > 0:
+            out_pred = frac_nonseasonal_undiff(out_pred_diffed, train_arr, frac_d)
+        else:
+            out_pred = out_pred_diffed
+
         residuals = np.array(train) - in_pred_full
 
         h_str = "x".join(str(hh) for hh in hidden)
+        d_str = f", d={frac_d}" if frac_d and frac_d > 0 else ""
         if exog_col_names:
             exog_label = ",".join(exog_col_names)
         else:
             exog_label = f"{n_exog_cols}var"
-        label = f"MLPX(lb={lookback}, h={h_str}, {activation}, [{exog_label}])"
+        label = f"MLPX(lb={lookback}, h={h_str}, {activation}{d_str}, [{exog_label}])"
 
         _model = model
         _scaler_y = scaler_y
         _scaler_x = scaler_x
         _lookback = lookback
-        _last_known = list(scaled_y[:len(train) + len(test)])
+        _last_known = list(scaled_y)
         _exog_col_names = exog_col_names or []
         _all_exog_col_names = all_exog_col_names or []
-        _total_len = len(train) + len(test)
+        _total_len = len(scaled_y)
+        _frac_d = frac_d
+        _train_arr = train_arr
 
         def fc(h, exog_future=None):
             if exog_future is None:
@@ -1335,8 +1442,13 @@ def run_mlpx(train, test, exog_train, exog_test,
                 p_val = _model.predict(x_in)[0]
                 preds_scaled.append(p_val)
                 seq.append(p_val)
-            pf = list(_scaler_y.inverse_transform(
+            pf_diffed = list(_scaler_y.inverse_transform(
                 np.array(preds_scaled).reshape(-1, 1)).flatten())
+            if _frac_d and _frac_d > 0:
+                all_orig = np.concatenate([_train_arr, np.array(test)])
+                pf = list(frac_nonseasonal_undiff(np.array(pf_diffed), all_orig, _frac_d))
+            else:
+                pf = pf_diffed
             lo, hi = residual_ci(residuals, pf, h, 0.95)
             lo80, hi80 = residual_ci(residuals, pf, h, 0.80)
             return pf, lo, hi, lo80, hi80
@@ -1355,15 +1467,28 @@ def run_mlpx(train, test, exog_train, exog_test,
 
 def auto_best_mlpx(train, test, exog_train, exog_test,
                    frequency="Triwulanan", exog_col_names=None,
-                   seasonal_period=None):
+                   seasonal_period=None, frac_d_sarfima=None):
     """Auto-tuning MLPX: coba semua kombinasi hyperparameter + subset eksogen.
 
     Membandingkan penggunaan seluruh variabel eksogen vs setiap variabel tunggal,
     lalu memilih kombinasi dengan MDAPE terkecil.
+    Neuron = min(⅔ × jumlah input, 20).
+    Differencing: d ∈ {0, d_sarfima, 1}.
+    Fourier: aktif untuk Harian/Mingguan/Bulanan/Triwulanan.
     """
     lookbacks = _get_lookbacks(frequency)
-    hidden_list = [(6,), (12,), (18,), (24,), (30,)]
     activations = ['relu', 'tanh']
+    use_fourier = frequency in _MLP_FOURIER_FREQ
+
+    # Kandidat differencing: 0, d_sarfima (jika tersedia & berbeda), 1
+    d_candidates = [0.0]
+    if frac_d_sarfima is not None and frac_d_sarfima > 0 and frac_d_sarfima != 1.0:
+        d_candidates.append(round(frac_d_sarfima, 4))
+    d_candidates.append(1.0)
+    d_candidates = sorted(set(d_candidates))
+
+    # sp untuk Fourier: gunakan seasonal_period hanya jika frekuensi mendukung
+    sp_fourier = seasonal_period if use_fourier else None
 
     n_cols = exog_train.shape[1] if exog_train.ndim > 1 else 1
 
@@ -1396,7 +1521,14 @@ def auto_best_mlpx(train, test, exog_train, exog_test,
         for lb in lookbacks:
             if lb >= len(train) - 2:
                 continue
-            for hid in hidden_list:
+            # Hitung neuron otomatis: min(⅔ × input, 20)
+            n_exog = ex_tr.shape[1] if ex_tr.ndim > 1 else 1
+            n_input = lb * 3 + (4 if sp_fourier else 0) + n_exog
+            n_hidden = min(int(round(n_input * 2 / 3)), 20)
+            n_hidden = max(n_hidden, 2)  # minimal 2 neuron
+            hid = (n_hidden,)
+
+            for d_try in d_candidates:
                 for act in activations:
                     try:
                         r = run_mlpx(train, test, ex_tr, ex_te,
@@ -1404,7 +1536,8 @@ def auto_best_mlpx(train, test, exog_train, exog_test,
                                      activation=act,
                                      exog_col_names=ex_names,
                                      all_exog_col_names=all_names,
-                                     seasonal_period=seasonal_period)
+                                     seasonal_period=sp_fourier,
+                                     frac_d=d_try)
                         if r is not None:
                             mdape = calc_mdape(r["out_actual"], r["out_pred"])
                             if not np.isnan(mdape) and (best is None or mdape < best):
@@ -2184,15 +2317,17 @@ def run_all_models(values, frequency, train_ratio=0.8,
     sarima_min_data = (2 * sp) if sp is not None else 4
     _sarima_best_order = None      # Akan diisi parameter SARIMA terbaik
     _sarima_best_seasonal_pq = None  # untuk dipakai SARIMAX sebagai titik awal
+    _sarima_best_frac_d = None     # d optimal SARFIMA untuk MLP/MLPX
     if len(train) >= sarima_min_data:
         try:
             s_order, s_seasonal_pq, s_frac_d, s_frac_D = auto_sarima_order(
                 train, test, sarima_sp,
                 max_p=max_p, max_q=max_q,
                 max_P=max_P, max_Q=max_Q)
-            # Simpan parameter SARIMA terbaik untuk dipakai SARIMAX
+            # Simpan parameter SARIMA terbaik untuk dipakai SARIMAX dan MLP/MLPX
             _sarima_best_order = s_order
             _sarima_best_seasonal_pq = s_seasonal_pq
+            _sarima_best_frac_d = s_frac_d
             r = run_sarima_frac_d(
                 train, test, order=s_order,
                 seasonal_pqd=s_seasonal_pq, sp=sarima_sp,
@@ -2257,13 +2392,18 @@ def run_all_models(values, frequency, train_ratio=0.8,
         skipped.append("SARIMAX (data eksogen tidak tersedia)")
 
     # 4. Neural Network (MLP) — auto-select best hyperparameters
+    #    Menggunakan d optimal SARFIMA sebagai salah satu kandidat differencing.
     if len(train) >= 6:
         try:
             _sp = FREQ_SEASONAL.get(frequency)
-            best_lb, best_hid, best_act = auto_best_mlp(train, test, frequency=frequency,
-                                                         seasonal_period=_sp)
+            best_lb, best_hid, best_act, best_d = auto_best_mlp(
+                train, test, frequency=frequency,
+                seasonal_period=_sp,
+                frac_d_sarfima=_sarima_best_frac_d)
             r = run_mlp(train, test, lookback=best_lb, hidden=best_hid,
-                        activation=best_act, seasonal_period=_sp)
+                        activation=best_act, seasonal_period=_sp
+                        if frequency in _MLP_FOURIER_FREQ else None,
+                        frac_d=best_d)
             if r: results.append(r)
             else: skipped.append("Neural Network (MLP)")
         except Exception:
@@ -2272,12 +2412,14 @@ def run_all_models(values, frequency, train_ratio=0.8,
         skipped.append("Neural Network (MLP)")
 
     # 5. MLPX — MLP dengan variabel eksogen (jika tersedia)
+    #    Menggunakan d optimal SARFIMA sebagai salah satu kandidat differencing.
     if use_sarimax and exog_train is not None and len(train) >= 6:
         try:
             r_mlpx = auto_best_mlpx(train, test, exog_train, exog_test,
                                     frequency=frequency,
                                     exog_col_names=exog_col_names,
-                                    seasonal_period=FREQ_SEASONAL.get(frequency))
+                                    seasonal_period=FREQ_SEASONAL.get(frequency),
+                                    frac_d_sarfima=_sarima_best_frac_d)
             if r_mlpx:
                 results.append(r_mlpx)
             else:
