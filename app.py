@@ -848,22 +848,24 @@ def frac_seasonal_undiff(diffed_values, original_series, d, s):
     return result
 
 
-def _frac_insample_undiff(fitted_diffed, actual_original, d, s):
+def _frac_insample_undiff(fitted_diffed, actual_original, d, s, offset=0):
     """Undiff in-sample: gunakan nilai AKTUAL sebagai history di setiap langkah.
 
     Ini berbeda dari frac_seasonal_undiff (untuk forecast) yang menggunakan
     nilai prediksi sendiri sebagai history untuk langkah berikutnya.
 
-    fitted_diffed[t] ≈ Σ_k w[k] * actual_original[t - k*s]
-    → actual_hat[t] = (fitted_diffed[t] - Σ_{k≥1} w[k] * actual[t-k*s]) / w[0]
+    fitted_diffed[t] ≈ Σ_k w[k] * actual_original[(offset+t) - k*s]
+    → actual_hat[t] = (fitted_diffed[t] - Σ_{k≥1} w[k] * actual[(offset+t)-k*s]) / w[0]
+
+    offset: posisi awal fitted_diffed dalam actual_original (misal lookback untuk MLP).
     """
     n = len(fitted_diffed)
-    weights = frac_diff_weights(d, n // s + 2)
+    weights = frac_diff_weights(d, (offset + n) // s + 2)
     result = np.zeros(n)
     for t in range(n):
         val = fitted_diffed[t]
         for k in range(1, len(weights)):
-            idx = t - k * s
+            idx = (offset + t) - k * s
             if idx < 0:
                 break
             val -= weights[k] * actual_original[idx]
@@ -1052,19 +1054,29 @@ def _fourier_features(t_index, seasonal_period, n_harmonics=2):
 
 
 def run_mlp(train, test, lookback=3, hidden=(64,), activation='relu',
-            seasonal_period=None):
-    """MLPRegressor (scikit-learn) untuk peramalan time series.
-    Fitur: sliding window + ΔY + rolling mean + Fourier features (sin/cos).
-    Total fitur per sampel = lookback * 3 + (4 jika seasonal_period).
+            seasonal_period=None, frac_d=0.0):
+    """MLPRegressor (scikit-learn) untuk peramalan time series — MLP with time trend.
+    Fitur: sliding window + ΔY + rolling mean + Fourier features + time trend.
+    Time trend (indeks waktu ternormalisasi) membantu model menangkap pola tren.
+    Total fitur per sampel = lookback * 3 + (4 jika seasonal_period) + 1 (time trend).
+    frac_d: orde fractional differencing (0 = tanpa differencing).
     """
     try:
-        combined = np.array(list(train) + list(test), dtype=float).reshape(-1, 1)
+        combined_orig = np.array(list(train) + list(test), dtype=float)
+
+        # ── Fractional differencing (jika d ≠ 0) ──
+        if frac_d and frac_d != 0:
+            combined_work, _ = frac_nonseasonal_diff(combined_orig, frac_d)
+        else:
+            combined_work = combined_orig.copy()
+
         scaler = MinMaxScaler(feature_range=(0, 1))
-        scaled = scaler.fit_transform(combined).flatten()
+        scaled = scaler.fit_transform(combined_work.reshape(-1, 1)).flatten()
 
         sp = seasonal_period  # shorthand
+        n_total = len(combined_work)  # untuk normalisasi time trend
 
-        # Buat fitur yang diperkaya: raw window + differencing + rolling mean + Fourier
+        # Buat fitur yang diperkaya: raw window + differencing + rolling mean + Fourier + time trend
         def build_features(seq, lookback):
             """Dari sequence 1D, buat X dan y dengan fitur tambahan."""
             X, y = [], []
@@ -1078,7 +1090,9 @@ def run_mlp(train, test, lookback=3, hidden=(64,), activation='relu',
                 feat_rmean = [np.mean(window[:j + 1]) for j in range(lookback)]
                 # Fitur 4: Fourier features (sin/cos) untuk pola musiman/siklus
                 feat_fourier = _fourier_features(i, sp) if sp else []
-                X.append(feat_raw + feat_diff + feat_rmean + feat_fourier)
+                # Fitur 5: time trend (indeks waktu ternormalisasi [0, 1])
+                feat_trend = [i / n_total]
+                X.append(feat_raw + feat_diff + feat_rmean + feat_fourier + feat_trend)
                 y.append(seq[i])
             return np.array(X), np.array(y)
 
@@ -1088,7 +1102,8 @@ def run_mlp(train, test, lookback=3, hidden=(64,), activation='relu',
             feat_diff = [0.0] + [window[j] - window[j - 1] for j in range(1, len(window))]
             feat_rmean = [np.mean(window[:j + 1]) for j in range(len(window))]
             feat_fourier = _fourier_features(t_index, sp) if sp else []
-            return np.array(feat_raw + feat_diff + feat_rmean + feat_fourier)
+            feat_trend = [t_index / n_total]
+            return np.array(feat_raw + feat_diff + feat_rmean + feat_fourier + feat_trend)
 
         scaled_train = scaled[:len(train)]
 
@@ -1112,11 +1127,19 @@ def run_mlp(train, test, lookback=3, hidden=(64,), activation='relu',
 
         # In-sample predictions
         in_pred_scaled = model.predict(X_train)
-        in_pred_full = np.full(len(train), np.nan)
         in_pred_unscaled = scaler.inverse_transform(in_pred_scaled.reshape(-1, 1)).flatten()
-        in_pred_full[lookback:] = in_pred_unscaled
-        if lookback > 0 and len(in_pred_unscaled) > 0:
-            in_pred_full[:lookback] = in_pred_unscaled[0]
+
+        # Undiff in-sample jika d ≠ 0
+        if frac_d and frac_d != 0:
+            in_pred_orig = _frac_insample_undiff(
+                in_pred_unscaled, np.array(train, dtype=float), frac_d, s=1, offset=lookback)
+        else:
+            in_pred_orig = in_pred_unscaled
+
+        in_pred_full = np.full(len(train), np.nan)
+        in_pred_full[lookback:] = in_pred_orig
+        if lookback > 0 and len(in_pred_orig) > 0:
+            in_pred_full[:lookback] = in_pred_orig[0]
 
         # Out-of-sample predictions (recursive)
         last_seq = list(scaled_train[-lookback:])
@@ -1129,11 +1152,19 @@ def run_mlp(train, test, lookback=3, hidden=(64,), activation='relu',
             out_pred_scaled.append(pred_val)
             last_seq.append(pred_val)
 
-        out_pred = scaler.inverse_transform(np.array(out_pred_scaled).reshape(-1, 1)).flatten()
+        out_pred_unscaled = scaler.inverse_transform(np.array(out_pred_scaled).reshape(-1, 1)).flatten()
+
+        # Undiff out-of-sample jika d ≠ 0
+        if frac_d and frac_d != 0:
+            out_pred = frac_nonseasonal_undiff(
+                out_pred_unscaled, np.array(train, dtype=float), frac_d)
+        else:
+            out_pred = out_pred_unscaled
+
         residuals = np.array(train) - in_pred_full
 
-        h_str = "x".join(str(h) for h in hidden)
-        label = f"MLP(lb={lookback}, h={h_str}, {activation})"
+        h_str = "x".join(str(hh) for hh in hidden)
+        label = f"MLP(lookback={lookback}, neuron={h_str}, {activation})"
 
         # Closure for forecast
         _model = model
@@ -1141,6 +1172,8 @@ def run_mlp(train, test, lookback=3, hidden=(64,), activation='relu',
         _lookback = lookback
         _last_known = list(scaled[:len(train) + len(test)])
         _total_len = len(train) + len(test)
+        _combined_orig_hist = combined_orig[:len(train) + len(test)].copy()
+        _frac_d = frac_d
 
         def fc(h):
             seq = list(_last_known[-_lookback:])
@@ -1151,8 +1184,13 @@ def run_mlp(train, test, lookback=3, hidden=(64,), activation='relu',
                 p_val = _model.predict(x_in)[0]
                 preds_scaled.append(p_val)
                 seq.append(p_val)
-            pf = list(_scaler.inverse_transform(
+            pf_raw = list(_scaler.inverse_transform(
                 np.array(preds_scaled).reshape(-1, 1)).flatten())
+            if _frac_d and _frac_d != 0:
+                pf = list(frac_nonseasonal_undiff(
+                    np.array(pf_raw), _combined_orig_hist, _frac_d))
+            else:
+                pf = pf_raw
             lo, hi = residual_ci(residuals, pf, h, 0.95)
             lo80, hi80 = residual_ci(residuals, pf, h, 0.80)
             return pf, lo, hi, lo80, hi80
@@ -1170,12 +1208,12 @@ def run_mlp(train, test, lookback=3, hidden=(64,), activation='relu',
 def _get_lookbacks(frequency):
     """Tentukan kandidat lookback berdasarkan frekuensi data."""
     lb_map = {
-        "Harian": [3, 5, 7, 14],
-        "Mingguan": [2, 4, 8],
-        "Bulanan": [3, 6, 12],
-        "Triwulanan": [2, 3, 4],
-        "Semesteran": [2, 3, 4],
-        "Tahunan": [2, 3, 4],
+        "Harian": [3, 5, 7, 14, 21],
+        "Mingguan": [2, 4, 8, 12],
+        "Bulanan": [3, 6, 12, 18],
+        "Triwulanan": [2, 3, 4, 6],
+        "Semesteran": [2, 3, 4, 6],
+        "Tahunan": [2, 3, 4, 5],
     }
     return lb_map.get(frequency, [2, 3, 4])
 
@@ -1184,13 +1222,13 @@ def auto_best_mlp(train, test, frequency="Triwulanan", seasonal_period=None):
     """Coba beberapa kombinasi hyperparameter MLP, pilih MDAPE terkecil.
 
     Lookback disesuaikan dengan frekuensi data.
-    Hidden layer: single layer [6, 12, 18, 24, 30].
+    Hidden layer: single layer [18, 30].
     """
     lookbacks = _get_lookbacks(frequency)
-    hidden_list = [(6,), (12,), (18,), (24,), (30,)]
+    hidden_list = [(18,), (30,)]
     activations = ['relu', 'tanh']
 
-    best, best_cfg = None, (lookbacks[0], (12,), 'relu')
+    best, best_cfg = None, (lookbacks[0], (18,), 'relu')
     for lb in lookbacks:
         if lb >= len(train) - 2:
             continue
@@ -1212,16 +1250,24 @@ def auto_best_mlp(train, test, frequency="Triwulanan", seasonal_period=None):
 def run_mlpx(train, test, exog_train, exog_test,
              lookback=3, hidden=(12,), activation='relu',
              exog_col_names=None, all_exog_col_names=None,
-             seasonal_period=None):
+             seasonal_period=None, frac_d=0.0):
     """MLPRegressor dengan variabel eksogen.
 
     Fitur: sliding window + ΔY + rolling mean + Fourier features + variabel eksogen.
     all_exog_col_names: daftar lengkap nama kolom eksogen (untuk subsetting exog_future).
+    frac_d: orde fractional differencing (0 = tanpa differencing).
     """
     try:
-        combined = np.array(list(train) + list(test), dtype=float).reshape(-1, 1)
+        combined_orig = np.array(list(train) + list(test), dtype=float)
+
+        # ── Fractional differencing (jika d ≠ 0) ──
+        if frac_d and frac_d != 0:
+            combined_work, _ = frac_nonseasonal_diff(combined_orig, frac_d)
+        else:
+            combined_work = combined_orig.copy()
+
         scaler_y = MinMaxScaler(feature_range=(0, 1))
-        scaled_y = scaler_y.fit_transform(combined).flatten()
+        scaled_y = scaler_y.fit_transform(combined_work.reshape(-1, 1)).flatten()
 
         exog_all = np.vstack([exog_train, exog_test])
         scaler_x = MinMaxScaler(feature_range=(0, 1))
@@ -1273,11 +1319,19 @@ def run_mlpx(train, test, exog_train, exog_test,
 
         # In-sample
         in_pred_scaled = model.predict(X_train)
-        in_pred_full = np.full(len(train), np.nan)
         in_pred_unscaled = scaler_y.inverse_transform(in_pred_scaled.reshape(-1, 1)).flatten()
-        in_pred_full[lookback:] = in_pred_unscaled
-        if lookback > 0 and len(in_pred_unscaled) > 0:
-            in_pred_full[:lookback] = in_pred_unscaled[0]
+
+        # Undiff in-sample jika d ≠ 0
+        if frac_d and frac_d != 0:
+            in_pred_orig = _frac_insample_undiff(
+                in_pred_unscaled, np.array(train, dtype=float), frac_d, s=1, offset=lookback)
+        else:
+            in_pred_orig = in_pred_unscaled
+
+        in_pred_full = np.full(len(train), np.nan)
+        in_pred_full[lookback:] = in_pred_orig
+        if lookback > 0 and len(in_pred_orig) > 0:
+            in_pred_full[:lookback] = in_pred_orig[0]
 
         # Out-of-sample
         last_seq = list(scaled_train_y[-lookback:])
@@ -1292,7 +1346,15 @@ def run_mlpx(train, test, exog_train, exog_test,
             out_pred_scaled.append(pred_val)
             last_seq.append(pred_val)
 
-        out_pred = scaler_y.inverse_transform(np.array(out_pred_scaled).reshape(-1, 1)).flatten()
+        out_pred_unscaled = scaler_y.inverse_transform(np.array(out_pred_scaled).reshape(-1, 1)).flatten()
+
+        # Undiff out-of-sample jika d ≠ 0
+        if frac_d and frac_d != 0:
+            out_pred = frac_nonseasonal_undiff(
+                out_pred_unscaled, np.array(train, dtype=float), frac_d)
+        else:
+            out_pred = out_pred_unscaled
+
         residuals = np.array(train) - in_pred_full
 
         h_str = "x".join(str(hh) for hh in hidden)
@@ -1300,7 +1362,7 @@ def run_mlpx(train, test, exog_train, exog_test,
             exog_label = ",".join(exog_col_names)
         else:
             exog_label = f"{n_exog_cols}var"
-        label = f"MLPX(lb={lookback}, h={h_str}, {activation}, [{exog_label}])"
+        label = f"MLPX(lookback={lookback}, neuron={h_str}, {activation}, [{exog_label}])"
 
         _model = model
         _scaler_y = scaler_y
@@ -1310,6 +1372,8 @@ def run_mlpx(train, test, exog_train, exog_test,
         _exog_col_names = exog_col_names or []
         _all_exog_col_names = all_exog_col_names or []
         _total_len = len(train) + len(test)
+        _combined_orig_hist = combined_orig[:len(train) + len(test)].copy()
+        _frac_d = frac_d
 
         def fc(h, exog_future=None):
             if exog_future is None:
@@ -1335,8 +1399,13 @@ def run_mlpx(train, test, exog_train, exog_test,
                 p_val = _model.predict(x_in)[0]
                 preds_scaled.append(p_val)
                 seq.append(p_val)
-            pf = list(_scaler_y.inverse_transform(
+            pf_raw = list(_scaler_y.inverse_transform(
                 np.array(preds_scaled).reshape(-1, 1)).flatten())
+            if _frac_d and _frac_d != 0:
+                pf = list(frac_nonseasonal_undiff(
+                    np.array(pf_raw), _combined_orig_hist, _frac_d))
+            else:
+                pf = pf_raw
             lo, hi = residual_ci(residuals, pf, h, 0.95)
             lo80, hi80 = residual_ci(residuals, pf, h, 0.80)
             return pf, lo, hi, lo80, hi80
@@ -1362,7 +1431,7 @@ def auto_best_mlpx(train, test, exog_train, exog_test,
     lalu memilih kombinasi dengan MDAPE terkecil.
     """
     lookbacks = _get_lookbacks(frequency)
-    hidden_list = [(6,), (12,), (18,), (24,), (30,)]
+    hidden_list = [(18,), (30,)]
     activations = ['relu', 'tanh']
 
     n_cols = exog_train.shape[1] if exog_train.ndim > 1 else 1
@@ -2036,11 +2105,15 @@ MODEL_INFO = {
         },
     },
     "Neural Network (MLP)": {
-        "desc": "Multi-Layer Perceptron — jaringan saraf tiruan feedforward yang mempelajari pola non-linier "
-                "dalam data deret waktu melalui sliding window. Hyperparameter (lookback, hidden layers, "
-                "activation) dipilih otomatis berdasarkan MDAPE terkecil. Menggunakan scikit-learn MLPRegressor.",
+        "desc": "Multi-Layer Perceptron with time trend — jaringan saraf tiruan feedforward yang mempelajari pola non-linier "
+                "dalam data deret waktu. Model menggunakan fitur sliding window, first difference (ΔY), rolling mean, "
+                "Fourier features (untuk pola musiman), serta time trend (indeks waktu ternormalisasi) sebagai fitur bawaan "
+                "untuk menangkap pola tren deterministik. "
+                "Hyperparameter (lookback, hidden neurons, activation) dipilih otomatis berdasarkan MDAPE terkecil. "
+                "Menggunakan scikit-learn MLPRegressor.",
         "pros": [
             "Mampu menangkap pola non-linier yang kompleks",
+            "Menangani tren deterministik secara otomatis melalui time trend bawaan",
             "Ringan dan cepat — tidak memerlukan TensorFlow/GPU",
             "Hasil deterministik (reproducible) dengan random_state tetap",
             "Fleksibel — bisa mempelajari berbagai pola dari data",
@@ -2054,37 +2127,46 @@ MODEL_INFO = {
         ],
         "assumptions": [
             "Pola dalam data historis akan berlanjut di masa depan",
+            "Tren bersifat deterministik (linier terhadap waktu)",
             "Data telah dinormalisasi (dilakukan otomatis via MinMaxScaler)",
             "Jumlah data cukup untuk pelatihan neural network (minimal 6 titik)",
             "Lookback window yang tepat menentukan seberapa jauh ke belakang model melihat",
             "Hubungan antar waktu bisa bersifat non-linier",
         ],
         "formula": [
-            r"z^{(l)} = W^{(l)} \cdot a^{(l-1)} + b^{(l)}",
-            r"a^{(l)} = g(z^{(l)})",
-            r"\text{ReLU}(z) = \max(0, z)",
-            r"\tanh(z) = \frac{e^z - e^{-z}}{e^z + e^{-z}}",
-            r"\hat{y} = W^{(L)} \cdot a^{(L-1)} + b^{(L)}",
-            r"L = \frac{1}{n}\sum_{i=1}^{n}(y_i - \hat{y}_i)^2",
+            r"\mathbf{x}_t = [\underbrace{Y_{t-1},\ldots,Y_{t-lb}}_{\text{sliding window}},\;"
+            r"\underbrace{\Delta Y_{t-1},\ldots}_{\text{first diff}},\;"
+            r"\underbrace{\bar{Y}_t}_{\text{rolling mean}},\;"
+            r"\underbrace{\sin, \cos}_{\text{Fourier}},\;"
+            r"\underbrace{t/N}_{\text{time trend}}]",
+            r"\hat{Y}_t = f_{\text{MLP}}(\mathbf{x}_t)",
+            r"z^{(l)} = W^{(l)} \cdot a^{(l-1)} + b^{(l)}, \quad a^{(l)} = g(z^{(l)})",
+            r"\text{ReLU}(z) = \max(0, z), \quad \tanh(z) = \frac{e^z - e^{-z}}{e^z + e^{-z}}",
         ],
         "symbols": {
-            r"$z^{(l)}$": "Pre-activation pada layer ke-$l$",
-            r"$a^{(l)}$": "Aktivasi (output) pada layer ke-$l$",
+            r"$\mathbf{x}_t$": "Vektor fitur pada waktu $t$ (total = lookback×3 + 4 Fourier + 1 time trend)",
+            r"$Y_{t-i}$": "Nilai target pada $i$ langkah sebelumnya (sliding window)",
+            r"$\Delta Y_{t-i}$": "First difference: $Y_{t-i} - Y_{t-i-1}$",
+            r"$\bar{Y}_t$": "Rolling mean (rata-rata bergerak sepanjang lookback)",
+            r"$\sin, \cos$": "Fourier features untuk menangkap pola musiman",
+            r"$t/N$": "Time trend — indeks waktu ternormalisasi, menangkap tren deterministik",
             r"$W^{(l)}, b^{(l)}$": "Bobot dan bias pada layer ke-$l$ (dipelajari selama pelatihan)",
             r"$g(\cdot)$": "Fungsi aktivasi (ReLU atau tanh)",
-            r"$\hat{y}$": "Output prediksi dari layer terakhir",
-            r"$L$": "Loss function (Mean Squared Error)",
-            r"$n$": "Jumlah sampel pelatihan",
+            r"$\hat{Y}_t$": "Output prediksi",
         },
     },
     "MLPX": {
         "desc": "MLP with eXogenous variables — perluasan Neural Network MLP yang menyertakan variabel eksogen "
-                "sebagai fitur tambahan selain sliding window. Secara otomatis membandingkan penggunaan seluruh "
+                "sebagai fitur tambahan selain sliding window. Menggunakan fitur sliding window, first difference (ΔY), "
+                "rolling mean, dan Fourier features, ditambah variabel eksogen dari pengguna. "
+                "Time trend tidak disertakan secara otomatis — pengguna dapat menambahkannya sebagai variabel eksogen "
+                "jika diperlukan. Secara otomatis membandingkan penggunaan seluruh "
                 "variabel eksogen vs. masing-masing variabel individu, dan memilih kombinasi terbaik berdasarkan MDAPE.",
         "pros": [
             "Menangkap pengaruh non-linier dari variabel eksogen terhadap variabel target",
             "Otomatis memilih subset variabel eksogen terbaik (seluruh vs. individu)",
             "Mampu mempelajari interaksi kompleks antara lagged values dan variabel eksogen",
+            "Pengguna dapat menyertakan time trend sebagai variabel eksogen untuk menangkap tren",
             "Tetap ringan — menggunakan scikit-learn MLPRegressor",
         ],
         "cons": [
@@ -2101,16 +2183,19 @@ MODEL_INFO = {
         ],
         "formula": [
             r"\mathbf{x}_t = [\underbrace{Y_{t-1},\ldots,Y_{t-lb}}_{\text{sliding window}},\;"
-            r"\underbrace{\Delta Y_t, \bar{Y}_t}_{\text{fitur tambahan}},\;"
+            r"\underbrace{\Delta Y_{t-1},\ldots}_{\text{first diff}},\;"
+            r"\underbrace{\bar{Y}_t}_{\text{rolling mean}},\;"
+            r"\underbrace{\sin, \cos}_{\text{Fourier}},\;"
             r"\underbrace{X_{1,t},\ldots,X_{k,t}}_{\text{variabel eksogen}}]",
-            r"\hat{Y}_t = f_{\text{MLP}}(\mathbf{x}_t)",
+            r"\hat{Y}_t = f_{\text{MLPX}}(\mathbf{x}_t)",
         ],
         "symbols": {
             r"$\mathbf{x}_t$": "Vektor fitur pada waktu $t$",
             r"$Y_{t-i}$": "Nilai target pada $i$ langkah sebelumnya (sliding window)",
-            r"$\Delta Y_t$": "Differencing: $Y_t - Y_{t-1}$",
-            r"$\bar{Y}_t$": "Rolling mean (rata-rata bergerak)",
-            r"$X_{j,t}$": "Variabel eksogen ke-$j$ pada waktu $t$",
+            r"$\Delta Y_{t-i}$": "First difference: $Y_{t-i} - Y_{t-i-1}$",
+            r"$\bar{Y}_t$": "Rolling mean (rata-rata bergerak sepanjang lookback)",
+            r"$\sin, \cos$": "Fourier features untuk menangkap pola musiman",
+            r"$X_{j,t}$": "Variabel eksogen ke-$j$ pada waktu $t$ (termasuk time trend jika diberikan)",
             r"$lb$": "Lookback — jumlah langkah ke belakang",
             r"$k$": "Jumlah variabel eksogen",
         },
@@ -2184,15 +2269,17 @@ def run_all_models(values, frequency, train_ratio=0.8,
     sarima_min_data = (2 * sp) if sp is not None else 4
     _sarima_best_order = None      # Akan diisi parameter SARIMA terbaik
     _sarima_best_seasonal_pq = None  # untuk dipakai SARIMAX sebagai titik awal
+    _sarima_best_frac_d = 0.0       # d dari SARFIMA (disimpan untuk referensi)
     if len(train) >= sarima_min_data:
         try:
             s_order, s_seasonal_pq, s_frac_d, s_frac_D = auto_sarima_order(
                 train, test, sarima_sp,
                 max_p=max_p, max_q=max_q,
                 max_P=max_P, max_Q=max_Q)
-            # Simpan parameter SARIMA terbaik untuk dipakai SARIMAX
+            # Simpan parameter SARIMA terbaik untuk dipakai SARIMAX dan MLP/MLPX
             _sarima_best_order = s_order
             _sarima_best_seasonal_pq = s_seasonal_pq
+            _sarima_best_frac_d = s_frac_d if s_frac_d is not None else 0.0
             r = run_sarima_frac_d(
                 train, test, order=s_order,
                 seasonal_pqd=s_seasonal_pq, sp=sarima_sp,
@@ -2260,8 +2347,9 @@ def run_all_models(values, frequency, train_ratio=0.8,
     if len(train) >= 6:
         try:
             _sp = FREQ_SEASONAL.get(frequency)
-            best_lb, best_hid, best_act = auto_best_mlp(train, test, frequency=frequency,
-                                                         seasonal_period=_sp)
+            best_lb, best_hid, best_act = auto_best_mlp(
+                train, test, frequency=frequency,
+                seasonal_period=_sp)
             r = run_mlp(train, test, lookback=best_lb, hidden=best_hid,
                         activation=best_act, seasonal_period=_sp)
             if r: results.append(r)
@@ -3094,6 +3182,8 @@ Uji ADF/KPSS ditampilkan sebagai **informasi pendukung** untuk analisis.
                     _base = "SARIMA"
                 elif _base == "ARFIMA":
                     _base = "SARFIMA"
+                elif _base == "MLP":
+                    _base = "Neural Network (MLP)"
                 info = MODEL_INFO.get(r["name"]) or MODEL_INFO.get(_base)
                 if info:
                     st.markdown(f"**Deskripsi:** {info['desc']}")
@@ -3303,7 +3393,16 @@ Uji ADF/KPSS ditampilkan sebagai **informasi pendukung** untuk analisis.
                     strokeDash=alt.StrokeDash("Series:N", scale=alt.Scale(
                         domain=["Aktual", "Prediksi"], range=[[0], [5, 5]])),
                 ).properties(height=350)
-                st.altair_chart(line, use_container_width=True)
+
+                # Garis vertikal putus-putus merah: batas in-sample / out-of-sample
+                _boundary_idx = in_start + len(ia) - 1
+                _boundary_lbl = labels[_boundary_idx] if _boundary_idx < len(labels) else f"t{_boundary_idx+1}"
+                _rule_df = pd.DataFrame({"Periode": [_boundary_lbl]})
+                boundary_rule = alt.Chart(_rule_df).mark_rule(
+                    color='red', strokeDash=[5, 5], strokeWidth=2
+                ).encode(x=alt.X("Periode:N", sort=None))
+
+                st.altair_chart(line + boundary_rule, use_container_width=True)
 
                 # Download out-of-sample chart
                 safe_mn2 = re.sub(r'[^\w\-]', '_', r["name"])
@@ -3577,9 +3676,16 @@ Uji ADF/KPSS ditampilkan sebagai **informasi pendukung** untuk analisis.
             opacity=alt.condition(nearest, alt.value(0.5), alt.value(0)),
         ).transform_filter(nearest)
 
-        chart_all = alt.layer(line_all, points_all, rule_all).properties(height=450)
+        # Garis vertikal putus-putus merah: batas data aktual / ramalan
+        _rule_fc_df = pd.DataFrame({"Periode": [hist_labels[-1]]})
+        boundary_rule_fc = alt.Chart(_rule_fc_df).mark_rule(
+            color='red', strokeDash=[5, 5], strokeWidth=2
+        ).encode(x=alt.X("Periode:N", sort=None))
+
+        chart_all = alt.layer(line_all, points_all, rule_all, boundary_rule_fc).properties(height=450)
         st.altair_chart(chart_all, use_container_width=True)
-        st.caption("Garis solid tebal = data aktual. Garis putus-putus = ramalan masing-masing model.")
+        st.caption("Garis solid tebal = data aktual. Garis putus-putus = ramalan masing-masing model. "
+                   "Garis merah = batas data aktual dan ramalan.")
 
         # Download grafik semua model
         dl_series_all = {"Aktual": list(hist_values) + [None] * h}
@@ -3735,6 +3841,8 @@ Uji ADF/KPSS ditampilkan sebagai **informasi pendukung** untuk analisis.
                     base_name = "SARIMA"
                 elif base_name == "ARFIMA":
                     base_name = "SARFIMA"
+                elif base_name == "MLP":
+                    base_name = "Neural Network (MLP)"
                 info = MODEL_INFO.get(model_name) or MODEL_INFO.get(base_name)
                 if info:
                     st.markdown(f"**ℹ️ Deskripsi:** {info['desc']}")
