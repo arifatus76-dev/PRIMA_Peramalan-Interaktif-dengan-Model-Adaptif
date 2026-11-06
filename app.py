@@ -57,6 +57,26 @@ st.markdown("""
     }
     .rima-header h1 { margin: 0; font-size: 2.2rem; font-weight: 800; letter-spacing: 4px; }
     .rima-header p { margin: 4px 0 0 0; font-size: 1.05rem; opacity: 0.9; font-weight: 300; }
+
+    /* Expander styling — warna biru tua dengan aksen */
+    div[data-testid="stExpander"] {
+        border: 1.5px solid #2E86C1;
+        border-radius: 10px;
+        margin-bottom: 8px;
+    }
+    div[data-testid="stExpander"] summary {
+        color: #1B4F72;
+        font-weight: 600;
+    }
+    div[data-testid="stExpander"] summary:hover {
+        color: #2E86C1;
+    }
+
+    /* Checkbox styling — warna teal */
+    div[data-testid="stCheckbox"] label span {
+        color: #0E6655;
+        font-weight: 600;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -3401,8 +3421,15 @@ Uji ADF/KPSS ditampilkan sebagai **informasi pendukung** untuk analisis.
                 boundary_rule = alt.Chart(_rule_df).mark_rule(
                     color='red', strokeDash=[5, 5], strokeWidth=2
                 ).encode(x=alt.X("Periode:N", sort=None))
+                boundary_text = alt.Chart(_rule_df).mark_text(
+                    align='left', dx=5, dy=-10, fontSize=10,
+                    color='red', fontWeight='bold'
+                ).encode(
+                    x=alt.X("Periode:N", sort=None),
+                    text=alt.value("Batas In-sample / Out-of-sample"),
+                )
 
-                st.altair_chart(line + boundary_rule, use_container_width=True)
+                st.altair_chart(line + boundary_rule + boundary_text, use_container_width=True)
 
                 # Download out-of-sample chart
                 safe_mn2 = re.sub(r'[^\w\-]', '_', r["name"])
@@ -3681,11 +3708,18 @@ Uji ADF/KPSS ditampilkan sebagai **informasi pendukung** untuk analisis.
         boundary_rule_fc = alt.Chart(_rule_fc_df).mark_rule(
             color='red', strokeDash=[5, 5], strokeWidth=2
         ).encode(x=alt.X("Periode:N", sort=None))
+        boundary_text_fc = alt.Chart(_rule_fc_df).mark_text(
+            align='left', dx=5, dy=-10, fontSize=10,
+            color='red', fontWeight='bold'
+        ).encode(
+            x=alt.X("Periode:N", sort=None),
+            text=alt.value("Batas Aktual / Ramalan"),
+        )
 
-        chart_all = alt.layer(line_all, points_all, rule_all, boundary_rule_fc).properties(height=450)
+        chart_all = alt.layer(line_all, points_all, rule_all, boundary_rule_fc, boundary_text_fc).properties(height=450)
         st.altair_chart(chart_all, use_container_width=True)
         st.caption("Garis solid tebal = data aktual. Garis putus-putus = ramalan masing-masing model. "
-                   "Garis merah = batas data aktual dan ramalan.")
+                   "Garis merah putus-putus = batas data aktual dan ramalan.")
 
         # Download grafik semua model
         dl_series_all = {"Aktual": list(hist_values) + [None] * h}
