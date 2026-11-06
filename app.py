@@ -72,10 +72,17 @@ st.markdown("""
         color: #2E86C1;
     }
 
-    /* Checkbox styling — warna teal */
+    /* Checkbox styling — lebih mencolok */
+    div[data-testid="stCheckbox"] label {
+        background: linear-gradient(90deg, #e8f8f5 0%, #d1f2eb 100%);
+        padding: 8px 14px;
+        border-radius: 8px;
+        border-left: 4px solid #1ABC9C;
+    }
     div[data-testid="stCheckbox"] label span {
         color: #0E6655;
-        font-weight: 600;
+        font-weight: 700;
+        font-size: 0.95rem;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -3422,11 +3429,13 @@ Uji ADF/KPSS ditampilkan sebagai **informasi pendukung** untuk analisis.
                     color='red', strokeDash=[5, 5], strokeWidth=2
                 ).encode(x=alt.X("Periode:N", sort=None))
                 boundary_text = alt.Chart(_rule_df).mark_text(
-                    align='left', dx=5, dy=-10, fontSize=10,
-                    color='red', fontWeight='bold'
+                    align='left', dx=5, dy=0, fontSize=11,
+                    color='red', fontWeight='bold',
+                    baseline='top'
                 ).encode(
                     x=alt.X("Periode:N", sort=None),
-                    text=alt.value("Batas In-sample / Out-of-sample"),
+                    y=alt.value(340),
+                    text=alt.value("⬅ Batas In-sample / Out-of-sample"),
                 )
 
                 st.altair_chart(line + boundary_rule + boundary_text, use_container_width=True)
@@ -3709,11 +3718,13 @@ Uji ADF/KPSS ditampilkan sebagai **informasi pendukung** untuk analisis.
             color='red', strokeDash=[5, 5], strokeWidth=2
         ).encode(x=alt.X("Periode:N", sort=None))
         boundary_text_fc = alt.Chart(_rule_fc_df).mark_text(
-            align='left', dx=5, dy=-10, fontSize=10,
-            color='red', fontWeight='bold'
+            align='left', dx=5, dy=0, fontSize=11,
+            color='red', fontWeight='bold',
+            baseline='top'
         ).encode(
             x=alt.X("Periode:N", sort=None),
-            text=alt.value("Batas Aktual / Ramalan"),
+            y=alt.value(440),
+            text=alt.value("⬅ Batas Aktual / Ramalan"),
         )
 
         chart_all = alt.layer(line_all, points_all, rule_all, boundary_rule_fc, boundary_text_fc).properties(height=450)
